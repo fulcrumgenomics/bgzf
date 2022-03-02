@@ -1,0 +1,28 @@
+[package]
+name = "bgzf"
+version = "0.1.0"
+edition = "2021"
+authors = [
+    "Seth Stadick <seth@fulcrumgenomics.com>"
+]
+license = "MIT"
+readme = "README.md"
+documentation = "https://docs.rs/bgzf"
+homepage = "https://github.com/fulcrumgenomics/bgzf"
+repository = "https://github.com/fulcrumgenomics/bgzf"
+description = "Utility library for working with explicitly BGZF compressed data"
+keywords = ["bioinformatics", "genomic", "compression"]
+categories = ["science", "compression"]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+byteorder = "1.4.3"
+bytes = "1.1.0"
+libdeflater = "0.7.5"
+thiserror = "1.0.30"
+
+
+[dev-dependencies]
+tempfile = "3.2.0"
+proptest = "1.0.0"
