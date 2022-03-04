@@ -1,6 +1,6 @@
 [package]
 name = "bgzf"
-version = "0.2.0"
+version = "0.2.1-alpha.0"
 edition = "2021"
 authors = [
     "Seth Stadick <seth@fulcrumgenomics.com>"
