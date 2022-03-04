@@ -38,5 +38,5 @@ cargo test -- --ignored
 This assumes that you have installed `cargo-release` via `cargo install cargo-release` and have set up credentials with `crates.io`.
 
 ```bash
-cargo release <path|minor|major>
+cargo release <patch|minor|major>
 ```
