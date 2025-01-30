@@ -6,6 +6,15 @@
   <a href="https://crates.io/crates/bgzf"><img src="https://img.shields.io/crates/v/bgzf.svg?colorB=319e8c" alt="Version info"></a><br>
 </p>
 
+<p>
+<a href float="left"="https://fulcrumgenomics.com"><img src=".github/logos/fulcrumgenomics.svg" alt="Fulcrum Genomics" height="100"/></a>
+</p>
+
+[Visit us at Fulcrum Genomics](www.fulcrumgenomics.com) to learn more about how we can power your Bioinformatics with bgzf and beyond.
+
+<a href="mailto:contact@fulcrumgenomics.com?subject=[GitHub inquiry]"><img src="https://img.shields.io/badge/Email_us-brightgreen.svg?&style=for-the-badge&logo=gmail&logoColor=white"/></a>
+<a href="https://www.fulcrumgenomics.com"><img src="https://img.shields.io/badge/Visit_Us-blue.svg?&style=for-the-badge&logo=wordpress&logoColor=white"/></a>
+
 This library provides both high level readers and writers for the BGZF format as well as lower level compressor and decompressor functions.
 
 Bgzf is a multi-gzip format that adds an extra field to the header indicating how large the complete block (with header and footer) is.
