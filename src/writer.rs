@@ -8,7 +8,7 @@ use std::{
 use bytes::BytesMut;
 
 use crate::{
-    CompressionLevel, Compressor, BGZF_BLOCK_SIZE, BGZF_EOF, BUFSIZE, MAX_BGZF_BLOCK_SIZE,
+    BGZF_BLOCK_SIZE, BGZF_EOF, BUFSIZE, CompressionLevel, Compressor, MAX_BGZF_BLOCK_SIZE,
 };
 
 /// A BGZF writer.
