@@ -311,7 +311,10 @@ impl Default for Decompressor {
 
 /// Create an Bgzf style header.
 #[inline]
-fn header_inner(compression_level: CompressionLevel, compressed_size: u16) -> Vec<u8> {
+fn header_inner(
+    compression_level: CompressionLevel,
+    compressed_size: u16,
+) -> [u8; BGZF_HEADER_SIZE] {
     // Determine hint to place in header
     // From https://github.com/rust-lang/flate2-rs/blob/b2e976da21c18c8f31132e93a7f803b5e32f2b6d/src/gz/mod.rs#L235
     let comp_value = if compression_level.inner() >= &CompressionLvl::best() {
@@ -322,19 +325,20 @@ fn header_inner(compression_level: CompressionLevel, compressed_size: u16) -> Ve
         BGZF_COMPRESSION_HINT_OTHER
     };
 
-    let mut header: Vec<u8> = Vec::with_capacity(20);
-    header.write_u8(BGZF_MAGIC_BYTE_A).unwrap(); // magic byte
-    header.write_u8(BGZF_MAGIC_BYTE_B).unwrap(); // magic byte
-    header.write_u8(BGZF_COMPRESSION_METHOD).unwrap(); // compression method
-    header.write_u8(BGZF_NAME_COMMENT_EXTRA_FLAG).unwrap(); // name / comment / extraflag
-    header.write_u32::<LittleEndian>(BGZF_DEFAULT_MTIME).unwrap(); // mtime
-    header.write_u8(comp_value).unwrap(); // compression value
-    header.write_u8(BGZF_DEFAULT_OS).unwrap(); // OS
-    header.write_u16::<LittleEndian>(BGZF_EXTRA_FLAG_LEN).unwrap(); // Extra flag len
-    header.write_u8(BGZF_SUBFIELD_ID1).unwrap(); // Bgzf subfield ID 1
-    header.write_u8(BGZF_SUBFIELD_ID2).unwrap(); // Bgzf subfield ID2
-    header.write_u16::<LittleEndian>(BGZF_SUBFIELD_LEN).unwrap(); // Bgzf subfield len
-    header
+    let mut header = [0u8; BGZF_HEADER_SIZE];
+    let mut cursor = std::io::Cursor::new(&mut header[..]);
+    cursor.write_u8(BGZF_MAGIC_BYTE_A).unwrap(); // magic byte
+    cursor.write_u8(BGZF_MAGIC_BYTE_B).unwrap(); // magic byte
+    cursor.write_u8(BGZF_COMPRESSION_METHOD).unwrap(); // compression method
+    cursor.write_u8(BGZF_NAME_COMMENT_EXTRA_FLAG).unwrap(); // name / comment / extraflag
+    cursor.write_u32::<LittleEndian>(BGZF_DEFAULT_MTIME).unwrap(); // mtime
+    cursor.write_u8(comp_value).unwrap(); // compression value
+    cursor.write_u8(BGZF_DEFAULT_OS).unwrap(); // OS
+    cursor.write_u16::<LittleEndian>(BGZF_EXTRA_FLAG_LEN).unwrap(); // Extra flag len
+    cursor.write_u8(BGZF_SUBFIELD_ID1).unwrap(); // Bgzf subfield ID 1
+    cursor.write_u8(BGZF_SUBFIELD_ID2).unwrap(); // Bgzf subfield ID2
+    cursor.write_u16::<LittleEndian>(BGZF_SUBFIELD_LEN).unwrap(); // Bgzf subfield len
+    cursor
         .write_u16::<LittleEndian>(
             compressed_size + BGZF_HEADER_SIZE as u16 + BGZF_FOOTER_SIZE as u16 - 1,
         )
