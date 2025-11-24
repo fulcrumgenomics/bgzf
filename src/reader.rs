@@ -8,8 +8,8 @@ use std::{
 use bytes::{Buf, BytesMut};
 
 use crate::{
-    BGZF_BLOCK_SIZE, BGZF_HEADER_SIZE, BUFSIZE, Decompressor, check_header, get_block_size,
-    get_footer_values, strip_footer,
+    check_header, get_block_size, get_footer_values, strip_footer, Decompressor, BGZF_BLOCK_SIZE,
+    BGZF_HEADER_SIZE, BUFSIZE,
 };
 
 /// A BGZF reader.
