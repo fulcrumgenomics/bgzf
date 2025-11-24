@@ -205,6 +205,7 @@ impl Compressor {
     /// use bgzf::Compressor;
     /// let compressor = Compressor::new(3.try_into().expect("Invalid compression level"));
     /// ```
+    #[must_use]
     pub fn new(level: CompressionLevel) -> Self {
         Self { inner: libdeflater::Compressor::new(*level.inner()), level }
     }
@@ -394,6 +395,87 @@ mod test {
 
     use super::*;
 
+    /// Test that the EOF marker is written exactly once at the end of the output
+    /// when using finish().
+    #[test]
+    fn test_eof_marker_written_once_with_finish() {
+        // Test with data that doesn't fill a complete block
+        let mut output = Vec::new();
+        {
+            let mut writer = Writer::new(&mut output, CompressionLevel::new(3).unwrap());
+            writer.write_all(b"hello").unwrap();
+            writer.finish().unwrap();
+        }
+
+        // Verify EOF marker appears exactly once at the end
+        assert!(output.ends_with(BGZF_EOF), "Output should end with BGZF_EOF marker");
+
+        // Count occurrences of EOF marker
+        let eof_count = output.windows(BGZF_EOF.len()).filter(|w| *w == BGZF_EOF).count();
+        assert_eq!(eof_count, 1, "EOF marker should appear exactly once");
+    }
+
+    /// Test that EOF marker is written exactly once when relying on Drop.
+    #[test]
+    fn test_eof_marker_written_once_on_drop() {
+        let mut output = Vec::new();
+        {
+            let mut writer = Writer::new(&mut output, CompressionLevel::new(3).unwrap());
+            writer.write_all(b"hello").unwrap();
+            // Don't call finish(), let Drop handle it
+        }
+
+        // Verify EOF marker appears exactly once at the end
+        assert!(output.ends_with(BGZF_EOF), "Output should end with BGZF_EOF marker");
+
+        // Count occurrences of EOF marker
+        let eof_count = output.windows(BGZF_EOF.len()).filter(|w| *w == BGZF_EOF).count();
+        assert_eq!(eof_count, 1, "EOF marker should appear exactly once");
+    }
+
+    /// Test that EOF marker is written even when the buffer is empty.
+    #[test]
+    fn test_eof_marker_empty_write() {
+        let mut output = Vec::new();
+        {
+            let writer = Writer::new(&mut output, CompressionLevel::new(3).unwrap());
+            // Don't write any data, just finish
+            writer.finish().unwrap();
+        }
+
+        // Should still have the EOF marker
+        assert!(
+            output.ends_with(BGZF_EOF),
+            "Output should end with BGZF_EOF marker even with no data written"
+        );
+        // With no data, output should be exactly the EOF marker
+        assert_eq!(output.as_slice(), BGZF_EOF);
+    }
+
+    /// Test that calling flush() multiple times doesn't write multiple EOF markers.
+    #[test]
+    fn test_multiple_flush_single_eof() {
+        let mut output = Vec::new();
+        {
+            let mut writer = Writer::new(&mut output, CompressionLevel::new(3).unwrap());
+            writer.write_all(b"hello").unwrap();
+            writer.flush().unwrap();
+            writer.write_all(b"world").unwrap();
+            writer.flush().unwrap();
+            writer.finish().unwrap();
+        }
+
+        // Verify EOF marker appears exactly once at the end
+        assert!(output.ends_with(BGZF_EOF), "Output should end with BGZF_EOF marker");
+
+        // Count occurrences of EOF marker
+        let eof_count = output.windows(BGZF_EOF.len()).filter(|w| *w == BGZF_EOF).count();
+        assert_eq!(
+            eof_count, 1,
+            "EOF marker should appear exactly once even after multiple flush() calls"
+        );
+    }
+
     #[test]
     fn test_simple_bgzfsync() {
         let dir = tempdir().unwrap();
@@ -418,8 +500,7 @@ mod test {
         // Compress input to output
         let mut bgzf = Writer::new(out_writer, CompressionLevel::new(3).unwrap());
         bgzf.write_all(input).unwrap();
-        bgzf.flush().unwrap();
-        drop(bgzf);
+        bgzf.finish().unwrap();
 
         // Read output back in
         let mut reader = BufReader::new(File::open(output_file).unwrap());
@@ -456,8 +537,7 @@ mod test {
             for chunk in input.chunks(write_size) {
                 writer.write_all(chunk).unwrap();
             }
-            writer.flush().unwrap();
-            drop(writer);
+            writer.finish().unwrap();
 
             // Read output back in
             let mut reader = BufReader::new(File::open(output_file).unwrap());
