@@ -1,6 +1,7 @@
-use std::io::Write;
+use std::io::{BufWriter, Write};
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use tempfile::tempdir;
 
 use bgzf::{CompressionLevel, Compressor, Writer, BGZF_BLOCK_SIZE};
 
@@ -63,10 +64,42 @@ fn bench_writer_throughput(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_writer_file_io(c: &mut Criterion) {
+    let input: Vec<u8> = (0..BGZF_BLOCK_SIZE * 100).map(|i| (i % 256) as u8).collect();
+    let dir = tempdir().unwrap();
+
+    let mut group = c.benchmark_group("writer_file_io");
+    group.throughput(Throughput::Bytes(input.len() as u64));
+
+    group.bench_function("unbuffered", |b| {
+        let path = dir.path().join("unbuffered.bgz");
+        b.iter(|| {
+            let file = std::fs::File::create(&path).unwrap();
+            let mut writer = Writer::new(file, CompressionLevel::new(6).unwrap());
+            writer.write_all(black_box(&input)).unwrap();
+            writer.finish().unwrap();
+        })
+    });
+
+    group.bench_function("bufwriter_256k", |b| {
+        let path = dir.path().join("buffered.bgz");
+        b.iter(|| {
+            let file = std::fs::File::create(&path).unwrap();
+            let file = BufWriter::with_capacity(256 * 1024, file);
+            let mut writer = Writer::new(file, CompressionLevel::new(6).unwrap());
+            writer.write_all(black_box(&input)).unwrap();
+            writer.finish().unwrap();
+        })
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_compressor_single_block,
     bench_compressor_levels,
-    bench_writer_throughput
+    bench_writer_throughput,
+    bench_writer_file_io
 );
 criterion_main!(benches);
