@@ -31,7 +31,7 @@ pub use writer::*;
 
 use std::io;
 
-use byteorder::{ByteOrder, LittleEndian, WriteBytesExt};
+use byteorder::{ByteOrder, LittleEndian};
 use libdeflater::CompressionLvl;
 use thiserror::Error;
 
@@ -63,31 +63,29 @@ pub(crate) static BGZF_EOF: &[u8] = &[
 
 pub(crate) const BGZF_HEADER_SIZE: usize = 18;
 pub(crate) const BGZF_FOOTER_SIZE: usize = 8;
-pub(crate) const BGZF_MAGIC_BYTE_A: u8 = 31;
-pub(crate) const BGZF_MAGIC_BYTE_B: u8 = 139;
-pub(crate) const BGZF_COMPRESSION_METHOD: u8 = 8;
 pub(crate) const BGZF_NAME_COMMENT_EXTRA_FLAG: u8 = 4;
-pub(crate) const BGZF_DEFAULT_MTIME: u32 = 0;
-pub(crate) const BGZF_DEFAULT_OS: u8 = 255;
-pub(crate) const BGZF_EXTRA_FLAG_LEN: u16 = 6;
 pub(crate) const BGZF_SUBFIELD_ID1: u8 = b'B';
 pub(crate) const BGZF_SUBFIELD_ID2: u8 = b'C';
-pub(crate) const BGZF_SUBFIELD_LEN: u16 = 2;
 pub(crate) const BGZF_BLOCK_SIZE_OFFSET: usize = 16;
+pub(crate) const BGZF_XFL_OFFSET: usize = 8;
 
 pub(crate) const BGZF_COMPRESSION_HINT_BEST: u8 = 2;
 pub(crate) const BGZF_COMPRESSION_HINT_FASTEST: u8 = 4;
 pub(crate) const BGZF_COMPRESSION_HINT_OTHER: u8 = 0;
 
-const EXTRA: f64 = 0.1;
-
-/// Add 10% of the size of the input data to the size of the output amount to account for
-/// compression levels that actually increase the output datasize for some inputs (i.e totally
-/// random input data).
-#[inline]
-fn extra_amount(input_len: usize) -> usize {
-    std::cmp::max(128, (input_len as f64 * EXTRA) as usize)
-}
+/// Pre-computed BGZF header template. Only bytes 8 (XFL) and 16-17 (BSIZE) vary.
+const HEADER_TEMPLATE: [u8; BGZF_HEADER_SIZE] = [
+    0x1f, 0x8b, // ID1, ID2 (magic)
+    0x08, // CM = DEFLATE
+    0x04, // FLG = FEXTRA
+    0x00, 0x00, 0x00, 0x00, // MTIME = 0
+    0x00, // XFL = placeholder (byte 8)
+    0xff, // OS = 255
+    0x06, 0x00, // XLEN = 6
+    b'B', b'C', // SI1, SI2
+    0x02, 0x00, // SLEN = 2
+    0x00, 0x00, // BSIZE placeholder (bytes 16-17)
+];
 
 type BgzfResult<T> = Result<T, BgzfError>;
 
@@ -221,32 +219,40 @@ impl Compressor {
     }
 
     /// Compress a block of bytes, adding a header and footer.
-    #[inline]
+    #[inline(always)]
     pub fn compress(&mut self, input: &[u8], buffer: &mut Vec<u8>) -> BgzfResult<()> {
-        buffer.resize_with(
-            BGZF_HEADER_SIZE + input.len() + extra_amount(input.len()) + BGZF_FOOTER_SIZE,
-            || 0,
-        );
+        // Use libdeflate's official bound calculation
+        let compress_bound = self.inner_mut().deflate_compress_bound(input.len());
+        let required_size = BGZF_HEADER_SIZE + compress_bound + BGZF_FOOTER_SIZE;
+
+        buffer.clear();
+        buffer.resize(required_size, 0);
 
         let bytes_written = self
             .inner_mut()
             .deflate_compress(input, &mut buffer[BGZF_HEADER_SIZE..])
             .map_err(BgzfError::LibDeflaterCompress)?;
 
-        // Make sure that compressed buffer is smaller than
         if bytes_written >= MAX_BGZF_BLOCK_SIZE {
             return Err(BgzfError::BlockSizeExceeded(bytes_written, MAX_BGZF_BLOCK_SIZE));
         }
-        let mut check = libdeflater::Crc::new();
-        check.update(input);
 
-        // Add header with total byte sizes
+        // Compute CRC32
+        let mut crc = libdeflater::Crc::new();
+        crc.update(input);
+
+        // Write header
         let header = header_inner(self.level, bytes_written as u16);
         buffer[0..BGZF_HEADER_SIZE].copy_from_slice(&header);
-        buffer.truncate(BGZF_HEADER_SIZE + bytes_written);
 
-        buffer.write_u32::<LittleEndian>(check.sum())?;
-        buffer.write_u32::<LittleEndian>(input.len() as u32)?;
+        // Write footer directly at computed offset
+        let footer_offset = BGZF_HEADER_SIZE + bytes_written;
+        buffer[footer_offset..footer_offset + 4].copy_from_slice(&crc.sum().to_le_bytes());
+        buffer[footer_offset + 4..footer_offset + 8]
+            .copy_from_slice(&(input.len() as u32).to_le_bytes());
+
+        // Truncate to final size
+        buffer.truncate(footer_offset + BGZF_FOOTER_SIZE);
 
         Ok(())
     }
@@ -310,15 +316,16 @@ impl Default for Decompressor {
     }
 }
 
-/// Create an Bgzf style header.
-#[inline]
+/// Create a BGZF header with the given compression level and compressed size.
+#[inline(always)]
 fn header_inner(
     compression_level: CompressionLevel,
     compressed_size: u16,
 ) -> [u8; BGZF_HEADER_SIZE] {
-    // Determine hint to place in header
-    // From https://github.com/rust-lang/flate2-rs/blob/b2e976da21c18c8f31132e93a7f803b5e32f2b6d/src/gz/mod.rs#L235
-    let comp_value = if compression_level.inner() >= &CompressionLvl::best() {
+    let mut header = HEADER_TEMPLATE;
+
+    // Patch XFL (compression hint)
+    header[BGZF_XFL_OFFSET] = if compression_level.inner() >= &CompressionLvl::best() {
         BGZF_COMPRESSION_HINT_BEST
     } else if compression_level.inner() <= &CompressionLvl::fastest() {
         BGZF_COMPRESSION_HINT_FASTEST
@@ -326,24 +333,10 @@ fn header_inner(
         BGZF_COMPRESSION_HINT_OTHER
     };
 
-    let mut header = [0u8; BGZF_HEADER_SIZE];
-    let mut cursor = std::io::Cursor::new(&mut header[..]);
-    cursor.write_u8(BGZF_MAGIC_BYTE_A).unwrap(); // magic byte
-    cursor.write_u8(BGZF_MAGIC_BYTE_B).unwrap(); // magic byte
-    cursor.write_u8(BGZF_COMPRESSION_METHOD).unwrap(); // compression method
-    cursor.write_u8(BGZF_NAME_COMMENT_EXTRA_FLAG).unwrap(); // name / comment / extraflag
-    cursor.write_u32::<LittleEndian>(BGZF_DEFAULT_MTIME).unwrap(); // mtime
-    cursor.write_u8(comp_value).unwrap(); // compression value
-    cursor.write_u8(BGZF_DEFAULT_OS).unwrap(); // OS
-    cursor.write_u16::<LittleEndian>(BGZF_EXTRA_FLAG_LEN).unwrap(); // Extra flag len
-    cursor.write_u8(BGZF_SUBFIELD_ID1).unwrap(); // Bgzf subfield ID 1
-    cursor.write_u8(BGZF_SUBFIELD_ID2).unwrap(); // Bgzf subfield ID2
-    cursor.write_u16::<LittleEndian>(BGZF_SUBFIELD_LEN).unwrap(); // Bgzf subfield len
-    cursor
-        .write_u16::<LittleEndian>(
-            compressed_size + BGZF_HEADER_SIZE as u16 + BGZF_FOOTER_SIZE as u16 - 1,
-        )
-        .unwrap(); // Size of block including header and footer - 1 BLEN
+    // Patch BSIZE (little-endian u16)
+    let bsize = compressed_size + BGZF_HEADER_SIZE as u16 + BGZF_FOOTER_SIZE as u16 - 1;
+    header[BGZF_BLOCK_SIZE_OFFSET..BGZF_BLOCK_SIZE_OFFSET + 2]
+        .copy_from_slice(&bsize.to_le_bytes());
 
     header
 }
