@@ -13,3 +13,15 @@ Bgzf is a multi-gzip format that adds an extra field to the header indicating ho
 ## Documentation and Examples
 
 Please see the generated [Rust Docs](https://docs.rs/bgzf).
+
+## Benchmarks
+
+Run the compression benchmarks with:
+
+```bash
+cargo bench
+```
+
+This runs [Criterion](https://github.com/bheisler/criterion.rs) benchmarks measuring:
+- Single block compression at various levels
+- Writer throughput
