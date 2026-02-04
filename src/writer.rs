@@ -1,7 +1,7 @@
 //! A BGZF writer implementation.
 use std::{
     fs::File,
-    io::{self, Write},
+    io::{self, BufWriter, Write},
     path::Path,
 };
 
@@ -114,8 +114,21 @@ impl Writer<File> {
     where
         P: AsRef<Path>,
     {
-        // TODO: benchmark whether there is any benefit to using a BufWriter
         File::create(path).map(|f| Self::new(f, compression_level))
+    }
+}
+
+impl Writer<BufWriter<File>> {
+    /// Create a buffered BGZF writer from a [`Path`].
+    ///
+    /// Uses a 256KiB buffer to batch write syscalls. This may improve
+    /// performance when writing to files, especially on high-latency storage.
+    pub fn from_path_buffered<P>(path: P, compression_level: CompressionLevel) -> io::Result<Self>
+    where
+        P: AsRef<Path>,
+    {
+        File::create(path)
+            .map(|f| Self::new(BufWriter::with_capacity(256 * 1024, f), compression_level))
     }
 }
 
