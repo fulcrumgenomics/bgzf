@@ -20,7 +20,7 @@
 //!     Ok(())
 //! }
 //! ```
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 #![allow(clippy::must_use_candidate, clippy::missing_errors_doc, clippy::missing_panics_doc)]
 
 // Re-export the reader and writer to the same level.
@@ -34,6 +34,26 @@ use std::io;
 use byteorder::{ByteOrder, LittleEndian};
 use libdeflater::CompressionLvl;
 use thiserror::Error;
+
+/// Buffer operations that avoid unnecessary memory initialization.
+mod buffer_ops {
+    /// Resizes a buffer to `new_len` without initializing the new bytes.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that all bytes in `0..new_len` are written
+    /// before any of them are read. This is safe because:
+    /// - `u8` has no invalid bit patterns
+    /// - `reserve_exact()` ensures sufficient capacity
+    /// - The buffer is cleared first, so no stale data remains
+    #[inline(always)]
+    #[allow(unsafe_code, clippy::uninit_vec)]
+    pub(crate) unsafe fn resize_uninit(buffer: &mut Vec<u8>, new_len: usize) {
+        buffer.clear();
+        buffer.reserve_exact(new_len);
+        buffer.set_len(new_len);
+    }
+}
 
 /// The maximum uncompressed blocksize for BGZF compression (taken from bgzip), used for initializing blocks.
 pub const BGZF_BLOCK_SIZE: usize = 65280;
@@ -63,6 +83,7 @@ pub(crate) static BGZF_EOF: &[u8] = &[
 
 pub(crate) const BGZF_HEADER_SIZE: usize = 18;
 pub(crate) const BGZF_FOOTER_SIZE: usize = 8;
+pub(crate) const BGZF_SIZEOF_CRC32: usize = 4;
 pub(crate) const BGZF_NAME_COMMENT_EXTRA_FLAG: u8 = 4;
 pub(crate) const BGZF_SUBFIELD_ID1: u8 = b'B';
 pub(crate) const BGZF_SUBFIELD_ID2: u8 = b'C';
@@ -225,8 +246,15 @@ impl Compressor {
         let compress_bound = self.inner_mut().deflate_compress_bound(input.len());
         let required_size = BGZF_HEADER_SIZE + compress_bound + BGZF_FOOTER_SIZE;
 
-        buffer.clear();
-        buffer.resize(required_size, 0);
+        // SAFETY: All bytes in 0..final_len are written before the function returns:
+        // - bytes 0..18: header via copy_from_slice
+        // - bytes 18..18+bytes_written: written by deflate_compress
+        // - bytes footer_offset..footer_offset+8: footer via copy_from_slice
+        // - buffer is truncated to final_len, removing any uninitialized trailing bytes
+        #[allow(unsafe_code)]
+        unsafe {
+            buffer_ops::resize_uninit(buffer, required_size);
+        }
 
         let bytes_written = self
             .inner_mut()
@@ -247,11 +275,12 @@ impl Compressor {
 
         // Write footer directly at computed offset
         let footer_offset = BGZF_HEADER_SIZE + bytes_written;
-        buffer[footer_offset..footer_offset + 4].copy_from_slice(&crc.sum().to_le_bytes());
-        buffer[footer_offset + 4..footer_offset + 8]
+        buffer[footer_offset..footer_offset + BGZF_SIZEOF_CRC32]
+            .copy_from_slice(&crc.sum().to_le_bytes());
+        buffer[footer_offset + BGZF_SIZEOF_CRC32..footer_offset + BGZF_FOOTER_SIZE]
             .copy_from_slice(&(input.len() as u32).to_le_bytes());
 
-        // Truncate to final size
+        // Truncate to final size (removes uninitialized bytes beyond footer)
         buffer.truncate(footer_offset + BGZF_FOOTER_SIZE);
 
         Ok(())
