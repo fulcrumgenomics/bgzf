@@ -13,6 +13,9 @@ use crate::{
 
 /// A BGZF reader.
 ///
+/// Each block's CRC32 is validated by default. For a faster read of trusted, transient
+/// uncompressed data you can turn that off — see [`Reader::with_crc_validation`].
+///
 /// # Example
 ///
 /// ```rust
@@ -50,6 +53,8 @@ where
     /// Holds the 18-byte BGZF header plus the following 5-byte DEFLATE block header, read together
     /// so the stored fast path can be chosen without a second read.
     header_buffer: Vec<u8>,
+    /// Whether to recompute and check each block's CRC32 (default: `true`).
+    validate_crc: bool,
     decompressor: Decompressor,
     reader: R,
 }
@@ -66,9 +71,38 @@ where
             block_pos: 0,
             block_end: 0,
             header_buffer: vec![0u8; BGZF_HEADER_SIZE + DEFLATE_STORED_HEADER_SIZE],
+            validate_crc: true,
             decompressor: Decompressor::new(),
             reader,
         }
+    }
+
+    /// Enable or disable CRC32 validation of each block's uncompressed data (default: enabled).
+    ///
+    /// BGZF stores a CRC32 of every block's uncompressed bytes; by default the reader recomputes
+    /// and checks it, rejecting corrupt blocks. Disabling validation skips that pass — a sizable
+    /// speedup for store-only (uncompressed) data, where decoding is otherwise CRC-bound — but the
+    /// block's *uncompressed content* is then not verified at all: it is copied verbatim on the
+    /// stored path, and only its length and decodability are checked on the compressed path. The
+    /// cheap structural checks — block framing and uncompressed-size (ISIZE) agreement — still run,
+    /// so a malformed block is still rejected; only content corruption that preserves the block's
+    /// length goes undetected.
+    ///
+    /// This reads more leniently than the format intends (samtools/htslib always verify), so disable
+    /// it only for trusted, transient streams whose integrity is already assured — e.g. uncompressed
+    /// BAM piped between processes — never for data read from disk or an untrusted source.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use bgzf::Reader;
+    /// # let compressed: &[u8] = &[];
+    /// let reader = Reader::new(compressed).with_crc_validation(false);
+    /// ```
+    #[must_use]
+    pub fn with_crc_validation(mut self, validate: bool) -> Self {
+        self.validate_crc = validate;
+        self
     }
 }
 
@@ -160,12 +194,14 @@ where
                             BgzfError::InvalidHeader("stored block length disagrees with footer"),
                         ));
                     }
-                    let found = crc32(&self.decompressed_buffer[..len]);
-                    if found != check.sum {
-                        return Err(io::Error::new(
-                            io::ErrorKind::Other,
-                            BgzfError::InvalidChecksum { found, expected: check.sum },
-                        ));
+                    if self.validate_crc {
+                        let found = crc32(&self.decompressed_buffer[..len]);
+                        if found != check.sum {
+                            return Err(io::Error::new(
+                                io::ErrorKind::Other,
+                                BgzfError::InvalidChecksum { found, expected: check.sum },
+                            ));
+                        }
                     }
                     self.block_pos = 0;
                     self.block_end = len;
@@ -200,6 +236,7 @@ where
                     strip_footer(compressed),
                     &mut self.decompressed_buffer[..decompressed_len],
                     check,
+                    self.validate_crc,
                 )
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
             self.block_pos = 0;
