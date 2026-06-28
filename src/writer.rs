@@ -73,7 +73,11 @@ where
     ///
     /// By default the capacity is [`bgzf::BUFSIZE`]. The capacity must be less than or equal to [`bgzf::BGZF_BLOCK_SIZE`].
     pub fn with_capacity(writer: W, compression_level: CompressionLevel, blocksize: usize) -> Self {
-        assert!(blocksize <= BGZF_BLOCK_SIZE);
+        // A zero block size would loop forever while emitting blocks.
+        assert!(
+            (1..=BGZF_BLOCK_SIZE).contains(&blocksize),
+            "blocksize must be in 1..={BGZF_BLOCK_SIZE}"
+        );
         let compressor = Compressor::new(compression_level);
         // Level 0 stores data uncompressed; assemble each framed block directly in this buffer.
         let store_only = u8::from(compression_level) == 0;

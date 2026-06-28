@@ -270,8 +270,11 @@ impl Compressor {
             .deflate_compress(input, &mut buffer[BGZF_HEADER_SIZE..])
             .map_err(BgzfError::LibDeflaterCompress)?;
 
-        if bytes_written >= MAX_BGZF_BLOCK_SIZE {
-            return Err(BgzfError::BlockSizeExceeded(bytes_written, MAX_BGZF_BLOCK_SIZE));
+        // The whole block (header + deflate output + footer) must fit in BSIZE+1, i.e. be at most
+        // MAX_BGZF_BLOCK_SIZE; otherwise BSIZE (a u16) would overflow in `header_inner`.
+        let block_size = BGZF_HEADER_SIZE + bytes_written + BGZF_FOOTER_SIZE;
+        if block_size > MAX_BGZF_BLOCK_SIZE {
+            return Err(BgzfError::BlockSizeExceeded(block_size, MAX_BGZF_BLOCK_SIZE));
         }
 
         // Write header
@@ -591,6 +594,33 @@ mod test {
         let mut out = vec![];
         let result = Reader::new(block.as_slice()).read_to_end(&mut out);
         assert!(result.is_err(), "block whose ISIZE exceeds its payload must error");
+    }
+
+    /// A compressed block whose framing would exceed the maximum BGZF block size must be rejected,
+    /// not silently produce a corrupt (overflowed) BSIZE. Incompressible input near the size limit
+    /// drives `bytes_written` into the range where a too-loose guard would let the u16 BSIZE wrap.
+    #[test]
+    fn compress_rejects_oversized_block_without_overflowing_bsize() {
+        fn incompressible(len: usize) -> Vec<u8> {
+            let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+            let mut out = Vec::with_capacity(len + 8);
+            while out.len() < len {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                out.extend_from_slice(&state.to_le_bytes());
+            }
+            out.truncate(len);
+            out
+        }
+
+        let mut compressor = Compressor::new(CompressionLevel::new(12).unwrap());
+        let mut block = vec![];
+        let result = compressor.compress(&incompressible(65_515), &mut block);
+        assert!(
+            matches!(result, Err(BgzfError::BlockSizeExceeded(..))),
+            "expected BlockSizeExceeded, got {result:?}"
+        );
     }
 
     /// A compressed block whose footer ISIZE exceeds the maximum BGZF block size must be rejected
