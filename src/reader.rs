@@ -1,7 +1,7 @@
 //! A Reader for BGZF compressed data.
 use std::{
     fs::File,
-    io::{self, Read},
+    io::{self, BufRead, Read},
     path::Path,
 };
 
@@ -104,6 +104,107 @@ where
         self.validate_crc = validate;
         self
     }
+
+    /// Read and decode the next BGZF block into `decompressed_buffer`, setting `block_pos`/
+    /// `block_end` to its bounds.
+    ///
+    /// Returns `Ok(true)` when a block was read (possibly an *empty* block, e.g. the EOF marker),
+    /// `Ok(false)` on a clean end of stream at a block boundary, and an error for a truncated or
+    /// malformed block. Assumes the current block is already exhausted (`block_pos == block_end`).
+    fn fetch_next_block(&mut self) -> io::Result<bool> {
+        // Read the 18-byte BGZF header together with the 5-byte DEFLATE block header. Reading
+        // both at once lets us choose the stored fast path without a second read: a clean EOF
+        // at a block boundary stops the stream, while a partial read signals a truncated block.
+        if !read_full(&mut self.reader, &mut self.header_buffer)? {
+            return Ok(false); // clean EOF
+        }
+        check_header(&self.header_buffer[..BGZF_HEADER_SIZE])
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+        // A valid block always holds at least a header and footer; anything smaller is a
+        // corrupt header and would underflow `payload_len`.
+        let block_size = get_block_size(&self.header_buffer[..BGZF_HEADER_SIZE]);
+        if block_size < BGZF_HEADER_SIZE + BGZF_FOOTER_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                BgzfError::InvalidHeader("block size smaller than header plus footer"),
+            ));
+        }
+        let payload_len = block_size - BGZF_HEADER_SIZE;
+
+        // The 5 bytes after the BGZF header are the DEFLATE block header. Copy them out so we
+        // can both inspect them and, on the inflate path, prepend them to the payload.
+        let deflate_header: [u8; DEFLATE_STORED_HEADER_SIZE] = self.header_buffer
+            [BGZF_HEADER_SIZE..]
+            .try_into()
+            .expect("header_buffer holds the DEFLATE block header");
+
+        // Fast path: a single final stored block that spans the whole payload holds its bytes
+        // verbatim. Read the data and its footer straight into the decompressed buffer (at
+        // offset 0, so callers drain an aligned, contiguous slice), skipping libdeflate and any
+        // staging copy, then verify the uncompressed size and CRC.
+        if let Some(len) = stored_block_len(&deflate_header) {
+            let with_footer = len + BGZF_FOOTER_SIZE;
+            if payload_len == DEFLATE_STORED_HEADER_SIZE + with_footer
+                && with_footer <= self.decompressed_buffer.len()
+            {
+                self.reader.read_exact(&mut self.decompressed_buffer[..with_footer])?;
+                let check = get_footer_values(&self.decompressed_buffer[..with_footer]);
+                if check.amount as usize != len {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        BgzfError::InvalidHeader("stored block length disagrees with footer"),
+                    ));
+                }
+                if self.validate_crc {
+                    let found = crc32(&self.decompressed_buffer[..len]);
+                    if found != check.sum {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Other,
+                            BgzfError::InvalidChecksum { found, expected: check.sum },
+                        ));
+                    }
+                }
+                self.block_pos = 0;
+                self.block_end = len;
+                return Ok(true);
+            }
+        }
+
+        // Inflate path: reassemble the payload (the 5 header bytes already read plus the
+        // remainder) into `compressed_buffer` and decompress it with libdeflate.
+        self.compressed_buffer[..DEFLATE_STORED_HEADER_SIZE].copy_from_slice(&deflate_header);
+        self.reader
+            .read_exact(&mut self.compressed_buffer[DEFLATE_STORED_HEADER_SIZE..payload_len])?;
+
+        let compressed = &self.compressed_buffer[..payload_len];
+        let check = get_footer_values(compressed);
+        let decompressed_len = check.amount as usize;
+
+        // The decompressed buffer is sized to the BGZF maximum; a block claiming more is
+        // corrupt and would otherwise index out of bounds.
+        if decompressed_len > self.decompressed_buffer.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                BgzfError::UncompressedSizeExceeded {
+                    found: decompressed_len,
+                    max: self.decompressed_buffer.len(),
+                },
+            ));
+        }
+
+        self.decompressor
+            .decompress(
+                strip_footer(compressed),
+                &mut self.decompressed_buffer[..decompressed_len],
+                check,
+                self.validate_crc,
+            )
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        self.block_pos = 0;
+        self.block_end = decompressed_len;
+        Ok(true)
+    }
 }
 
 impl Reader<File> {
@@ -150,100 +251,39 @@ where
 
             debug_assert!(total_bytes_copied < buf.len(), "More bytes copied than requested.");
 
-            // Read the 18-byte BGZF header together with the 5-byte DEFLATE block header. Reading
-            // both at once lets us choose the stored fast path without a second read: a clean EOF
-            // at a block boundary stops the stream, while a partial read signals a truncated block.
-            if !read_full(&mut self.reader, &mut self.header_buffer)? {
+            if !self.fetch_next_block()? {
                 break; // clean EOF
             }
-            check_header(&self.header_buffer[..BGZF_HEADER_SIZE])
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-
-            // A valid block always holds at least a header and footer; anything smaller is a
-            // corrupt header and would underflow `payload_len`.
-            let block_size = get_block_size(&self.header_buffer[..BGZF_HEADER_SIZE]);
-            if block_size < BGZF_HEADER_SIZE + BGZF_FOOTER_SIZE {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    BgzfError::InvalidHeader("block size smaller than header plus footer"),
-                ));
-            }
-            let payload_len = block_size - BGZF_HEADER_SIZE;
-
-            // The 5 bytes after the BGZF header are the DEFLATE block header. Copy them out so we
-            // can both inspect them and, on the inflate path, prepend them to the payload.
-            let deflate_header: [u8; DEFLATE_STORED_HEADER_SIZE] = self.header_buffer
-                [BGZF_HEADER_SIZE..]
-                .try_into()
-                .expect("header_buffer holds the DEFLATE block header");
-
-            // Fast path: a single final stored block that spans the whole payload holds its bytes
-            // verbatim. Read the data and its footer straight into the decompressed buffer (at
-            // offset 0, so callers drain an aligned, contiguous slice), skipping libdeflate and any
-            // staging copy, then verify the uncompressed size and CRC.
-            if let Some(len) = stored_block_len(&deflate_header) {
-                let with_footer = len + BGZF_FOOTER_SIZE;
-                if payload_len == DEFLATE_STORED_HEADER_SIZE + with_footer
-                    && with_footer <= self.decompressed_buffer.len()
-                {
-                    self.reader.read_exact(&mut self.decompressed_buffer[..with_footer])?;
-                    let check = get_footer_values(&self.decompressed_buffer[..with_footer]);
-                    if check.amount as usize != len {
-                        return Err(io::Error::new(
-                            io::ErrorKind::Other,
-                            BgzfError::InvalidHeader("stored block length disagrees with footer"),
-                        ));
-                    }
-                    if self.validate_crc {
-                        let found = crc32(&self.decompressed_buffer[..len]);
-                        if found != check.sum {
-                            return Err(io::Error::new(
-                                io::ErrorKind::Other,
-                                BgzfError::InvalidChecksum { found, expected: check.sum },
-                            ));
-                        }
-                    }
-                    self.block_pos = 0;
-                    self.block_end = len;
-                    continue;
-                }
-            }
-
-            // Inflate path: reassemble the payload (the 5 header bytes already read plus the
-            // remainder) into `compressed_buffer` and decompress it with libdeflate.
-            self.compressed_buffer[..DEFLATE_STORED_HEADER_SIZE].copy_from_slice(&deflate_header);
-            self.reader
-                .read_exact(&mut self.compressed_buffer[DEFLATE_STORED_HEADER_SIZE..payload_len])?;
-
-            let compressed = &self.compressed_buffer[..payload_len];
-            let check = get_footer_values(compressed);
-            let decompressed_len = check.amount as usize;
-
-            // The decompressed buffer is sized to the BGZF maximum; a block claiming more is
-            // corrupt and would otherwise index out of bounds.
-            if decompressed_len > self.decompressed_buffer.len() {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    BgzfError::UncompressedSizeExceeded {
-                        found: decompressed_len,
-                        max: self.decompressed_buffer.len(),
-                    },
-                ));
-            }
-
-            self.decompressor
-                .decompress(
-                    strip_footer(compressed),
-                    &mut self.decompressed_buffer[..decompressed_len],
-                    check,
-                    self.validate_crc,
-                )
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-            self.block_pos = 0;
-            self.block_end = decompressed_len;
         }
 
         Ok(total_bytes_copied)
+    }
+}
+
+impl<R> BufRead for Reader<R>
+where
+    R: Read,
+{
+    /// Return the current block's unread decompressed bytes, decoding the next block when the
+    /// current one is exhausted.
+    ///
+    /// Empty blocks (e.g. the BGZF EOF marker) are skipped; an empty returned slice means end of
+    /// input. Implementing [`BufRead`] lets callers use [`read_until`](BufRead::read_until),
+    /// [`lines`](BufRead::lines), etc., and borrow the reader's decompressed buffer directly rather
+    /// than wrapping it in a `BufReader` — which would redundantly copy already-decompressed bytes
+    /// into a second buffer.
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        // Advance past any exhausted or empty blocks until data is available or the stream ends.
+        while self.block_pos == self.block_end {
+            if !self.fetch_next_block()? {
+                break; // clean EOF; the (empty) current block is returned below
+            }
+        }
+        Ok(&self.decompressed_buffer[self.block_pos..self.block_end])
+    }
+
+    fn consume(&mut self, amt: usize) {
+        self.block_pos = (self.block_pos + amt).min(self.block_end);
     }
 }
 

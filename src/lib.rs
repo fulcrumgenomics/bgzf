@@ -479,7 +479,7 @@ fn stored_block_len(deflate_header: &[u8]) -> Option<usize> {
 
 #[cfg(test)]
 mod test {
-    use std::io::{Read, Write};
+    use std::io::{BufRead, Read, Write};
     use std::{
         fs::File,
         io::{BufReader, BufWriter},
@@ -950,6 +950,72 @@ mod test {
         let mut decoded = vec![];
         Reader::new(blob.as_slice()).read_to_end(&mut decoded).unwrap();
         assert_eq!(decoded, input);
+    }
+
+    /// The reader implements [`BufRead`]: `lines()` yields the original lines (borrowing the
+    /// decompressed buffer rather than needing a wrapping `BufReader`).
+    #[test]
+    fn reader_bufread_lines_yields_original_lines() {
+        let text = "first line\nsecond line\nthird\n";
+        let mut blob = vec![];
+        let mut writer = Writer::new(&mut blob, CompressionLevel::new(6).unwrap());
+        writer.write_all(text.as_bytes()).unwrap();
+        writer.finish().unwrap();
+
+        let lines: Vec<String> =
+            Reader::new(blob.as_slice()).lines().collect::<std::io::Result<_>>().unwrap();
+        assert_eq!(lines, ["first line", "second line", "third"]);
+    }
+
+    /// `read_until` reads up to and including the delimiter, then the remainder streams normally.
+    #[test]
+    fn reader_bufread_read_until_delimiter() {
+        let mut blob = vec![];
+        let mut writer = Writer::new(&mut blob, CompressionLevel::new(3).unwrap());
+        writer.write_all(b"header\0payload bytes").unwrap();
+        writer.finish().unwrap();
+
+        let mut reader = Reader::new(blob.as_slice());
+        let mut first = vec![];
+        reader.read_until(0, &mut first).unwrap();
+        assert_eq!(first, b"header\0");
+        let mut rest = vec![];
+        reader.read_to_end(&mut rest).unwrap();
+        assert_eq!(rest, b"payload bytes");
+    }
+
+    /// Driving the reader purely through `fill_buf`/`consume` must reassemble a multi-block stream
+    /// byte-for-byte, transparently skipping empty blocks (the EOF marker) and ending on an empty
+    /// slice.
+    #[test]
+    fn reader_bufread_fill_buf_consume_across_blocks() {
+        let input: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect(); // spans blocks
+        let mut blob = vec![];
+        let mut writer = Writer::new(&mut blob, CompressionLevel::new(0).unwrap()); // store-only
+        writer.write_all(&input).unwrap();
+        writer.finish().unwrap();
+
+        let mut reader = Reader::new(blob.as_slice());
+        let mut out = vec![];
+        loop {
+            let chunk = reader.fill_buf().unwrap();
+            if chunk.is_empty() {
+                break; // end of input
+            }
+            // Consume in small pieces to exercise partial consumption within a block.
+            let take = chunk.len().min(7);
+            out.extend_from_slice(&chunk[..take]);
+            reader.consume(take);
+        }
+        assert_eq!(out, input);
+    }
+
+    /// `fill_buf` on an empty stream (only the EOF marker) returns an empty slice, not an error.
+    #[test]
+    fn reader_bufread_empty_stream_fills_empty() {
+        let mut blob = vec![];
+        Writer::new(&mut blob, CompressionLevel::new(6).unwrap()).finish().unwrap();
+        assert!(Reader::new(blob.as_slice()).fill_buf().unwrap().is_empty());
     }
 
     const DICT_SIZE: usize = 32768;

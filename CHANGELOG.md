@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `Reader` now implements `std::io::BufRead` (matching `MultithreadedReader`), enabling
+  `read_until`, `lines`, etc., and letting callers borrow the decompressed block buffer directly
+  instead of wrapping the reader in a `BufReader` (which would redundantly re-buffer already
+  decompressed bytes).
+
 ## [0.4.0] - 2026-07-04
 
 ### Added
