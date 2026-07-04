@@ -252,7 +252,7 @@ where
 /// Returns `Ok(true)` once `buf` is full, `Ok(false)` if the stream ends cleanly before any byte is
 /// read (a normal end-of-stream at a block boundary), and an error if the stream ends partway
 /// through (a truncated block) or the underlying read fails.
-fn read_full<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<bool> {
+pub(crate) fn read_full<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<bool> {
     let mut filled = 0;
     while filled < buf.len() {
         match reader.read(&mut buf[filled..]) {

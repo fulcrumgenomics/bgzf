@@ -30,6 +30,31 @@ Bgzf is a multi-gzip format that adds an extra field to the header indicating ho
 
 Please see the generated [Rust Docs](https://docs.rs/bgzf).
 
+## Multithreading
+
+The default `Reader`/`Writer` are single-threaded. Enable the optional
+`multithreading-simple` feature to also get `MultithreadedReader` and
+`MultithreadedWriter`, which (de)compress blocks in parallel on a dedicated pool of
+worker threads while preserving block order:
+
+```toml
+[dependencies]
+bgzf = { version = "0.4", features = ["multithreading-simple"] }
+```
+
+```rust
+use std::num::NonZero;
+use bgzf::MultithreadedReader;
+
+let reader = MultithreadedReader::with_worker_count(NonZero::new(4).unwrap(), input);
+```
+
+Each reader/writer owns its own worker threads (hence *simple*), as distinguished from a
+future `multithreading-pooled` feature that would share one thread pool across many
+instances. Read-ahead/write-ahead depth is decoupled from the worker count, so even a
+single-worker instance pipelines rather than stalling. Decompressed output is byte-identical
+to `Reader`, and compressed output is byte-identical to `Writer`, at every worker count.
+
 ## Benchmarks
 
 Run the compression benchmarks with:
@@ -41,3 +66,11 @@ cargo bench
 This runs [Criterion](https://github.com/bheisler/criterion.rs) benchmarks measuring:
 - Single block compression at various levels
 - Writer throughput
+- Reader throughput and read/write round-trips (including store-only)
+
+The multithreaded reader/writer benchmarks (single-threaded vs. 1/2/4 workers) require the
+feature:
+
+```bash
+cargo bench --features multithreading-simple --bench multithreaded
+```

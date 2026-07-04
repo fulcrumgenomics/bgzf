@@ -29,6 +29,18 @@ mod writer;
 pub use reader::*;
 pub use writer::*;
 
+// Per-instance multithreaded reader/writer: each owns a dedicated pool of worker
+// threads. Gated behind `multithreading-simple` so the channel dependency and the
+// threading machinery are absent from the default build.
+#[cfg(feature = "multithreading-simple")]
+mod multithreaded_reader;
+#[cfg(feature = "multithreading-simple")]
+mod multithreaded_writer;
+#[cfg(feature = "multithreading-simple")]
+pub use multithreaded_reader::*;
+#[cfg(feature = "multithreading-simple")]
+pub use multithreaded_writer::*;
+
 use std::io;
 
 use byteorder::{ByteOrder, LittleEndian};
