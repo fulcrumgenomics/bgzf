@@ -8,6 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Per-instance multithreaded reader and writer behind the optional `multithreading-simple`
+  feature: `MultithreadedReader` and `MultithreadedWriter` each own a dedicated pool of worker
+  threads that (de)compress blocks in parallel while preserving block order, exposing the same
+  `std::io::Read`/`Write` (and `BufRead`) interfaces as the single-threaded types. Decompressed
+  output is byte-identical to `Reader`, and compressed output is byte-identical to `Writer`, at
+  every worker count. The feature name distinguishes this per-instance model from a future
+  `multithreading-pooled` feature (one thread pool shared across many readers/writers). Adds
+  optional `crossbeam-channel` (pool queues) and `oneshot` (per-block result handoff)
+  dependencies; the default build is unchanged.
+  - Read-ahead/write-ahead depth is decoupled from worker count (channels and the recycled-buffer
+    pool are sized to `worker_count.max(8)`), so a single-worker instance still pipelines instead
+    of stalling on a synchronous per-block handoff.
+  - v1 note: the writer allocates one output buffer per block; compressed-buffer recycling is a
+    planned, benchmark-gated optimization.
 - Store-only (compression level 0) fast paths: `Writer` emits DEFLATE stored blocks directly
   (no libdeflate, no intermediate `BytesMut`), and `Reader` reads a single final stored block
   straight into its decompressed buffer, bypassing libdeflate. Reading incompressible data (which

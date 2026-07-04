@@ -71,7 +71,8 @@ where
 
     /// Create a writer with a set capacity.
     ///
-    /// By default the capacity is [`bgzf::BUFSIZE`]. The capacity must be less than or equal to [`bgzf::BGZF_BLOCK_SIZE`].
+    /// By default (via [`Writer::new`]) the block size is [`crate::BGZF_BLOCK_SIZE`], which is
+    /// also the maximum permitted; `blocksize` must be less than or equal to it.
     pub fn with_capacity(writer: W, compression_level: CompressionLevel, blocksize: usize) -> Self {
         // A zero block size would loop forever while emitting blocks.
         assert!(

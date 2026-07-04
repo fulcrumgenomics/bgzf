@@ -1,9 +1,11 @@
 [package]
 name = "bgzf"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
+rust-version = "1.85"
 authors = [
-    "Seth Stadick <seth@fulcrumgenomics.com>"
+    "Seth Stadick <seth@fulcrumgenomics.com>",
+    "Tim Fennell <tim@fulcrumgenomics.com>"
 ]
 license = "MIT"
 readme = "README.md"
@@ -22,6 +24,19 @@ bytes = "1.9"
 libdeflater = "1.0"
 thiserror = "1.0"
 
+# Channels for the per-instance multithreaded reader/writer. Optional: only the
+# `multithreading-simple` feature pulls them in, so the default build stays lean.
+# Narrowest sensible feature set: `std` (thread-parking blocking recv) only.
+# crossbeam-channel carries the pool's MPMC channels; `oneshot` is a purpose-built,
+# cheaper single-message channel for the per-block result handoff.
+crossbeam-channel = { version = "0.5", default-features = false, features = ["std"], optional = true }
+oneshot = { version = "0.2", default-features = false, features = ["std"], optional = true }
+
+[features]
+# Each `MultithreadedReader`/`MultithreadedWriter` owns a dedicated pool of worker
+# threads (as opposed to a future `multithreading-pooled` feature that would share
+# one thread pool across many readers/writers).
+multithreading-simple = ["dep:crossbeam-channel", "dep:oneshot"]
 
 [dev-dependencies]
 criterion = "0.5"
@@ -31,3 +46,14 @@ proptest = "1"
 [[bench]]
 name = "compression"
 harness = false
+
+[[bench]]
+name = "multithreaded"
+harness = false
+required-features = ["multithreading-simple"]
+
+# Build docs on docs.rs with all features so the feature-gated multithreaded types are
+# documented, and enable the `doc_cfg` feature badges (see `#![cfg_attr(docsrs, ...)]` in lib.rs).
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
