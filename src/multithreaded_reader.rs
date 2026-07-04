@@ -48,15 +48,26 @@ use crate::{
 /// `worker_count.max(MIN_BUFFERS)` so even a single-worker reader reads ahead.
 const MIN_BUFFERS: usize = 8;
 
-/// A recycled unit of work that cycles reader → worker → consumer → reader with no
-/// per-block allocation.
+/// A recycled unit of work that cycles reader → worker → consumer → reader with no per-block
+/// allocation.
+///
+/// `raw` and `data` are reused across blocks and only ever grow — their `Vec` length is a
+/// high-water mark, and the live bytes are `raw[..raw_len]` / `data[..data_len]`. Tracking the
+/// live length separately (rather than resizing the `Vec` each block) means the payload and
+/// decompressed regions are never re-zeroed per block; the only zero-fill is the one-time growth
+/// to the high-water mark during warm-up.
 #[derive(Default)]
 struct Buffer {
-    /// Raw block bytes: the 18-byte BGZF header + payload (deflate stream + 8-byte footer).
+    /// Backing store for raw block bytes (18-byte BGZF header + payload + 8-byte footer). The
+    /// current block is `raw[..raw_len]`.
     raw: Vec<u8>,
-    /// Decompressed block contents.
+    /// Length of the current raw block within `raw`.
+    raw_len: usize,
+    /// Backing store for decompressed bytes. The current block is `data[..data_len]`.
     data: Vec<u8>,
-    /// Consumer read cursor into `data`.
+    /// Length of the current decompressed block within `data`.
+    data_len: usize,
+    /// Consumer read cursor into `data[..data_len]`.
     pos: usize,
 }
 
@@ -194,15 +205,14 @@ where
                 io::Error::new(io::ErrorKind::Other, "bgzf worker thread stopped")
             })??;
 
-            // Swap the new block in and recycle the one we just finished serving.
-            let mut spent = std::mem::replace(&mut self.buffer, buffer);
+            // Swap the new block in and recycle the one we just finished serving. The spent
+            // buffer keeps its (high-water) length and capacity so the next block reuses them
+            // without re-zeroing; its `raw_len`/`data_len`/`pos` are set when it is refilled.
+            let spent = std::mem::replace(&mut self.buffer, buffer);
             self.buffer.pos = 0;
-            spent.raw.clear();
-            spent.data.clear();
-            spent.pos = 0;
             recycle_tx.send(spent).ok();
 
-            if !self.buffer.data.is_empty() {
+            if self.buffer.data_len > 0 {
                 return Ok(true);
             }
         }
@@ -216,10 +226,10 @@ where
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let mut copied = 0;
         while copied < buf.len() {
-            if self.buffer.pos >= self.buffer.data.len() && !self.next_block()? {
+            if self.buffer.pos >= self.buffer.data_len && !self.next_block()? {
                 break;
             }
-            let available = &self.buffer.data[self.buffer.pos..];
+            let available = &self.buffer.data[self.buffer.pos..self.buffer.data_len];
             let n = available.len().min(buf.len() - copied);
             buf[copied..copied + n].copy_from_slice(&available[..n]);
             self.buffer.pos += n;
@@ -234,14 +244,14 @@ where
     R: Read + Send + 'static,
 {
     fn fill_buf(&mut self) -> io::Result<&[u8]> {
-        if self.buffer.pos >= self.buffer.data.len() {
+        if self.buffer.pos >= self.buffer.data_len {
             self.next_block()?;
         }
-        Ok(&self.buffer.data[self.buffer.pos..])
+        Ok(&self.buffer.data[self.buffer.pos..self.buffer.data_len])
     }
 
     fn consume(&mut self, amt: usize) {
-        self.buffer.pos = (self.buffer.pos + amt).min(self.buffer.data.len());
+        self.buffer.pos = (self.buffer.pos + amt).min(self.buffer.data_len);
     }
 }
 
@@ -287,7 +297,7 @@ where
 {
     thread::spawn(move || {
         while let Ok(mut buffer) = recycle_rx.recv() {
-            match read_raw_block(&mut reader, &mut buffer.raw) {
+            match read_raw_block(&mut reader, &mut buffer) {
                 Ok(false) => break, // clean end of stream at a block boundary
                 Ok(true) => {
                     let (decoded_tx, decoded_rx) = bounded::<Decoded>(1);
@@ -320,45 +330,76 @@ fn spawn_inflaters(worker_count: usize, inflate_rx: InflateRx) -> Vec<JoinHandle
             thread::spawn(move || {
                 let mut decompressor = Decompressor::new();
                 while let Ok((mut buffer, decoded_tx)) = inflate_rx.recv() {
-                    let result = decode_block(&buffer.raw, &mut decompressor, &mut buffer.data)
-                        .map(|()| buffer);
-                    decoded_tx.send(result).ok();
+                    // `raw` and `data` are disjoint fields, so these borrows don't conflict.
+                    let result = decode_block(
+                        &buffer.raw[..buffer.raw_len],
+                        &mut buffer.data,
+                        &mut decompressor,
+                    );
+                    let message = match result {
+                        Ok(data_len) => {
+                            buffer.data_len = data_len;
+                            buffer.pos = 0;
+                            Ok(buffer)
+                        }
+                        Err(e) => Err(e),
+                    };
+                    decoded_tx.send(message).ok();
                 }
             })
         })
         .collect()
 }
 
-/// Read one raw BGZF block (header + payload + footer) into `raw`.
+/// Grow `buf` so that `buf[..len]` is a valid slice to write into.
+///
+/// The `Vec` length is a high-water mark that only grows and is never shrunk, so only the growth
+/// beyond the previous mark is ever zero-filled — a block at or below the mark reuses
+/// already-initialized bytes and does no memset.
+#[inline]
+fn grow_to(buf: &mut Vec<u8>, len: usize) {
+    if buf.len() < len {
+        buf.resize(len, 0);
+    }
+}
+
+/// Read one raw BGZF block (header + payload + footer) into `buffer.raw`, setting `buffer.raw_len`.
 ///
 /// Returns `Ok(true)` when a block was read, `Ok(false)` on a clean end of stream at a block
-/// boundary, and an error for a truncated or malformed block. Only the header is validated
-/// here (matching the single-threaded reader); the footer and payload are validated by the
-/// worker that decodes the block.
-fn read_raw_block<R: Read>(reader: &mut R, raw: &mut Vec<u8>) -> io::Result<bool> {
-    raw.resize(BGZF_HEADER_SIZE, 0);
-    if !read_full(reader, &mut raw[..BGZF_HEADER_SIZE])? {
+/// boundary, and an error for a truncated or malformed block. Only the header is validated here
+/// (matching the single-threaded reader); the footer and payload are validated by the worker that
+/// decodes the block.
+fn read_raw_block<R: Read>(reader: &mut R, buffer: &mut Buffer) -> io::Result<bool> {
+    let mut header = [0u8; BGZF_HEADER_SIZE];
+    if !read_full(reader, &mut header)? {
         return Ok(false);
     }
-    check_header(&raw[..BGZF_HEADER_SIZE]).map_err(to_io)?;
+    check_header(&header).map_err(to_io)?;
 
-    let block_size = get_block_size(&raw[..BGZF_HEADER_SIZE]);
+    let block_size = get_block_size(&header);
     if block_size < BGZF_HEADER_SIZE + BGZF_FOOTER_SIZE {
         return Err(to_io(BgzfError::InvalidHeader("block size smaller than header plus footer")));
     }
 
-    raw.resize(block_size, 0);
-    reader.read_exact(&mut raw[BGZF_HEADER_SIZE..])?;
+    grow_to(&mut buffer.raw, block_size);
+    buffer.raw[..BGZF_HEADER_SIZE].copy_from_slice(&header);
+    reader.read_exact(&mut buffer.raw[BGZF_HEADER_SIZE..block_size])?;
+    buffer.raw_len = block_size;
     Ok(true)
 }
 
-/// Decode one raw BGZF block into `out`, replacing its contents.
+/// Decode one raw BGZF block into `data`, returning the number of decompressed bytes written (the
+/// block occupies `data[..returned]`).
 ///
-/// Mirrors the single-threaded reader's per-block path: a single final stored block is
-/// copied verbatim (skipping libdeflate), anything else is inflated. In both cases the
-/// uncompressed size is checked against the footer's ISIZE and the CRC32 is verified.
-fn decode_block(raw: &[u8], decompressor: &mut Decompressor, out: &mut Vec<u8>) -> io::Result<()> {
-    out.clear();
+/// Mirrors the single-threaded reader's per-block path: a single final stored block is copied
+/// verbatim (skipping libdeflate), anything else is inflated. In both cases the uncompressed size
+/// is checked against the footer's ISIZE and the CRC32 is verified. `data` grows to a high-water
+/// mark and is written in place, so nothing is re-zeroed per block.
+fn decode_block(
+    raw: &[u8],
+    data: &mut Vec<u8>,
+    decompressor: &mut Decompressor,
+) -> io::Result<usize> {
     // Everything after the 18-byte header: the deflate stream followed by the 8-byte footer.
     // `read_raw_block` guarantees `raw.len() >= BGZF_HEADER_SIZE + BGZF_FOOTER_SIZE`.
     let payload = &raw[BGZF_HEADER_SIZE..];
@@ -374,25 +415,29 @@ fn decode_block(raw: &[u8], decompressor: &mut Decompressor, out: &mut Vec<u8>) 
                     "stored block length disagrees with footer",
                 )));
             }
-            let data = &payload[DEFLATE_STORED_HEADER_SIZE..DEFLATE_STORED_HEADER_SIZE + len];
-            let found = crc32(data);
+            let src = &payload[DEFLATE_STORED_HEADER_SIZE..DEFLATE_STORED_HEADER_SIZE + len];
+            let found = crc32(src);
             if found != check.sum {
                 return Err(to_io(BgzfError::InvalidChecksum { found, expected: check.sum }));
             }
-            out.extend_from_slice(data);
-            return Ok(());
+            grow_to(data, len);
+            data[..len].copy_from_slice(src);
+            return Ok(len);
         }
     }
 
-    // Inflate path. Guard the claimed size against the maximum block size before allocating.
+    // Inflate path. Guard the claimed size against the maximum block size before growing.
     if expected_len > MAX_BGZF_BLOCK_SIZE {
         return Err(to_io(BgzfError::UncompressedSizeExceeded {
             found: expected_len,
             max: MAX_BGZF_BLOCK_SIZE,
         }));
     }
-    out.resize(expected_len, 0);
-    decompressor.decompress(strip_footer(payload), out, check, true).map_err(to_io)
+    grow_to(data, expected_len);
+    decompressor
+        .decompress(strip_footer(payload), &mut data[..expected_len], check, true)
+        .map_err(to_io)?;
+    Ok(expected_len)
 }
 
 #[cfg(test)]
