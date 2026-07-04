@@ -61,8 +61,11 @@ pub const BGZF_BLOCK_SIZE: usize = 65280;
 /// 128 KB default buffer size, same as pigz.
 pub const BUFSIZE: usize = 128 * 1024;
 
-/// Default from bgzf: compress(BGZF_BLOCK_SIZE) < BGZF_MAX_BLOCK_SIZE
-/// 65536 which is u16::MAX + 1
+/// The maximum size, in bytes, of a complete BGZF block (header + payload + footer); the on-disk
+/// `BSIZE` field is this minus one, so it must fit in a `u16` (65536 = `u16::MAX` + 1). This is also
+/// the largest uncompressed size any single block can hold, so the reader sizes its decompression
+/// buffer to it and rejects blocks whose ISIZE claims more (see [`BgzfError::UncompressedSizeExceeded`]).
+/// Matches htslib's `BGZF_MAX_BLOCK_SIZE`.
 pub(crate) const MAX_BGZF_BLOCK_SIZE: usize = 64 * 1024;
 
 pub(crate) static BGZF_EOF: &[u8] = &[
@@ -83,6 +86,8 @@ pub(crate) static BGZF_EOF: &[u8] = &[
 
 pub(crate) const BGZF_HEADER_SIZE: usize = 18;
 pub(crate) const BGZF_FOOTER_SIZE: usize = 8;
+/// Size of a DEFLATE stored-block header: 1 byte (BFINAL/BTYPE) + LEN (u16 LE) + NLEN (u16 LE).
+pub(crate) const DEFLATE_STORED_HEADER_SIZE: usize = 5;
 pub(crate) const BGZF_SIZEOF_CRC32: usize = 4;
 pub(crate) const BGZF_NAME_COMMENT_EXTRA_FLAG: u8 = 4;
 pub(crate) const BGZF_SUBFIELD_ID1: u8 = b'B';
@@ -123,6 +128,8 @@ pub enum BgzfError {
     InvalidChecksum { found: u32, expected: u32 },
     #[error("Invalid block header: {0}")]
     InvalidHeader(&'static str),
+    #[error("Uncompressed block size ({found}) exceeds maximum ({max})")]
+    UncompressedSizeExceeded { found: usize, max: usize },
     #[error("LibDeflater compression error: {0:?}")]
     LibDeflaterCompress(libdeflater::CompressionError),
     #[error(transparent)]
@@ -140,7 +147,9 @@ struct ChecksumValues {
 
 /// Level of compression to use for for the compressors.
 ///
-/// Valid values are 1-12. See [libdeflater](https://github.com/ebiggers/libdeflate#compression-levels) documentation on levels.
+/// Valid values are 0-12, where 0 stores the data uncompressed (DEFLATE stored blocks) and is the
+/// fastest to both write and read. Levels 1-12 invoke libdeflate; see its
+/// [documentation](https://github.com/ebiggers/libdeflate#compression-levels) on levels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompressionLevel(CompressionLvl);
 
@@ -148,7 +157,7 @@ pub struct CompressionLevel(CompressionLvl);
 impl CompressionLevel {
     /// Create a new [`CompressionLevel`] instance.
     ///
-    /// Valid levels are 1-12.
+    /// Valid levels are 0-12; level 0 stores the data uncompressed.
     #[allow(clippy::cast_lossless)]
     pub fn new(level: u8) -> BgzfResult<Self> {
         // libdeflater::CompressionLvlError contains no information
@@ -261,13 +270,12 @@ impl Compressor {
             .deflate_compress(input, &mut buffer[BGZF_HEADER_SIZE..])
             .map_err(BgzfError::LibDeflaterCompress)?;
 
-        if bytes_written >= MAX_BGZF_BLOCK_SIZE {
-            return Err(BgzfError::BlockSizeExceeded(bytes_written, MAX_BGZF_BLOCK_SIZE));
+        // The whole block (header + deflate output + footer) must fit in BSIZE+1, i.e. be at most
+        // MAX_BGZF_BLOCK_SIZE; otherwise BSIZE (a u16) would overflow in `header_inner`.
+        let block_size = BGZF_HEADER_SIZE + bytes_written + BGZF_FOOTER_SIZE;
+        if block_size > MAX_BGZF_BLOCK_SIZE {
+            return Err(BgzfError::BlockSizeExceeded(block_size, MAX_BGZF_BLOCK_SIZE));
         }
-
-        // Compute CRC32
-        let mut crc = libdeflater::Crc::new();
-        crc.update(input);
 
         // Write header
         let header = header_inner(self.level, bytes_written as u16);
@@ -276,7 +284,7 @@ impl Compressor {
         // Write footer directly at computed offset
         let footer_offset = BGZF_HEADER_SIZE + bytes_written;
         buffer[footer_offset..footer_offset + BGZF_SIZEOF_CRC32]
-            .copy_from_slice(&crc.sum().to_le_bytes());
+            .copy_from_slice(&crc32(input).to_le_bytes());
         buffer[footer_offset + BGZF_SIZEOF_CRC32..footer_offset + BGZF_FOOTER_SIZE]
             .copy_from_slice(&(input.len() as u32).to_le_bytes());
 
@@ -322,18 +330,29 @@ impl Decompressor {
         input: &[u8],
         output: &mut [u8],
         checksum_values: ChecksumValues,
+        validate_crc: bool,
     ) -> BgzfResult<()> {
-        if checksum_values.amount != 0 {
-            let _bytes_decompressed = self.inner_mut().deflate_decompress(input, output)?;
-        }
-        let mut new_check = libdeflater::Crc::new();
-        new_check.update(output);
+        let decompressed = if checksum_values.amount != 0 {
+            self.inner_mut().deflate_decompress(input, output)?
+        } else {
+            0
+        };
 
-        if checksum_values.sum != new_check.sum() {
-            return Err(BgzfError::InvalidChecksum {
-                found: new_check.sum(),
-                expected: checksum_values.sum,
-            });
+        // The size check is cheap and guards against serving stale buffer bytes (a corrupt block
+        // can produce fewer than the footer's ISIZE), so it always runs regardless of CRC settings;
+        // it reports the real CRC of what was produced (this is the cold error path, so computing it
+        // is free). The full CRC pass below is the expensive part and is skipped when the caller has
+        // opted out of validation. When the size matches, `output` and `output[..decompressed]` are
+        // the same slice.
+        if decompressed != output.len() {
+            let found = crc32(&output[..decompressed]);
+            return Err(BgzfError::InvalidChecksum { found, expected: checksum_values.sum });
+        }
+        if validate_crc {
+            let found = crc32(output);
+            if found != checksum_values.sum {
+                return Err(BgzfError::InvalidChecksum { found, expected: checksum_values.sum });
+            }
         }
         Ok(())
     }
@@ -402,6 +421,36 @@ fn get_footer_values(input: &[u8]) -> ChecksumValues {
 #[inline]
 fn strip_footer(input: &[u8]) -> &[u8] {
     &input[..input.len() - BGZF_FOOTER_SIZE]
+}
+
+/// Compute the gzip/BGZF CRC32 of `data`.
+#[inline]
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = libdeflater::Crc::new();
+    crc.update(data);
+    crc.sum()
+}
+
+/// If `deflate_header` (the start of a DEFLATE stream) begins a single, final *stored*
+/// (uncompressed) block, return its declared length (`LEN`); otherwise return `None`.
+///
+/// BGZF written at compression level 0 — and the "no compression" mode of other tools — encodes
+/// each block this way. The caller still confirms that `LEN` matches the block's framing, CRC and
+/// uncompressed size before trusting it; any other shape (real compressed data, the empty EOF
+/// block, a non-final or multi-block stream, or a corrupt length field) returns `None` and is left
+/// to the normal decompression path.
+#[inline]
+fn stored_block_len(deflate_header: &[u8]) -> Option<usize> {
+    // The header is a 1-byte field (BFINAL in bit 0, BTYPE in bits 1-2) followed by LEN and NLEN
+    // (u16 little-endian, NLEN = !LEN). A final stored block has BFINAL=1, BTYPE=00, i.e. low three
+    // bits 0b001.
+    if deflate_header.len() < DEFLATE_STORED_HEADER_SIZE || deflate_header[0] & 0b0000_0111 != 0b001
+    {
+        return None;
+    }
+    let len = u16::from_le_bytes([deflate_header[1], deflate_header[2]]);
+    let nlen = u16::from_le_bytes([deflate_header[3], deflate_header[4]]);
+    (nlen == !len).then_some(len as usize)
 }
 
 #[cfg(test)]
@@ -538,6 +587,347 @@ mod test {
         assert_eq!(input.to_vec(), bytes);
     }
 
+    /// A block whose footer ISIZE claims more uncompressed bytes than the DEFLATE
+    /// payload actually produces must be rejected as corrupt, rather than serving the
+    /// stale bytes left in the reader's reused decompression buffer from a prior block.
+    #[test]
+    fn block_claiming_more_bytes_than_payload_is_rejected() {
+        let mut compressor = Compressor::new(CompressionLevel::new(3).unwrap());
+        let mut block = vec![];
+        compressor.compress(b"hello world", &mut block).unwrap();
+
+        // Inflate the footer's ISIZE (last four bytes, little-endian) past the real size.
+        let len = block.len();
+        block[len - 4..].copy_from_slice(&200u32.to_le_bytes());
+
+        let mut out = vec![];
+        let result = Reader::new(block.as_slice()).read_to_end(&mut out);
+        assert!(result.is_err(), "block whose ISIZE exceeds its payload must error");
+    }
+
+    /// A compressed block whose framing would exceed the maximum BGZF block size must be rejected,
+    /// not silently produce a corrupt (overflowed) BSIZE. Incompressible input near the size limit
+    /// drives `bytes_written` into the range where a too-loose guard would let the u16 BSIZE wrap.
+    #[test]
+    fn compress_rejects_oversized_block_without_overflowing_bsize() {
+        fn incompressible(len: usize) -> Vec<u8> {
+            let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+            let mut out = Vec::with_capacity(len + 8);
+            while out.len() < len {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                out.extend_from_slice(&state.to_le_bytes());
+            }
+            out.truncate(len);
+            out
+        }
+
+        let mut compressor = Compressor::new(CompressionLevel::new(12).unwrap());
+        let mut block = vec![];
+        let result = compressor.compress(&incompressible(65_515), &mut block);
+        assert!(
+            matches!(result, Err(BgzfError::BlockSizeExceeded(..))),
+            "expected BlockSizeExceeded, got {result:?}"
+        );
+    }
+
+    /// A compressed block whose footer ISIZE exceeds the maximum BGZF block size must be rejected
+    /// with [`BgzfError::UncompressedSizeExceeded`] rather than panicking against the fixed-size
+    /// decompression buffer. A compressed (non-stored) block is used so the reader takes the
+    /// libdeflate path where that guard lives.
+    #[test]
+    fn block_with_oversized_isize_is_rejected() {
+        let mut compressor = Compressor::new(CompressionLevel::new(6).unwrap());
+        let mut block = vec![];
+        compressor.compress(&[b'A'; 1024], &mut block).unwrap(); // compresses, so not a stored block
+
+        // Claim far more uncompressed bytes than the buffer can hold (last four bytes = ISIZE).
+        let len = block.len();
+        block[len - 4..].copy_from_slice(&100_000u32.to_le_bytes());
+
+        let mut out = vec![];
+        assert_bgzf_err(Reader::new(block.as_slice()).read_to_end(&mut out), |e| {
+            matches!(e, BgzfError::UncompressedSizeExceeded { .. })
+        });
+    }
+
+    /// Compression level 0 must emit a single final DEFLATE stored block — the shape the
+    /// reader's fast path detects and copies without invoking libdeflate.
+    #[test]
+    fn level_0_emits_a_single_final_stored_block() {
+        let mut compressor = Compressor::new(CompressionLevel::new(0).unwrap());
+        let input = b"the quick brown fox jumps over the lazy dog";
+        let mut block = vec![];
+        compressor.compress(input, &mut block).unwrap();
+
+        let deflate = &block[BGZF_HEADER_SIZE..block.len() - BGZF_FOOTER_SIZE];
+        let len = stored_block_len(deflate).expect("level 0 should produce a stored block");
+        assert_eq!(len, input.len());
+        assert_eq!(&deflate[DEFLATE_STORED_HEADER_SIZE..], input);
+    }
+
+    /// Real compressed data (level 6) is not a stored block, so the fast path must decline it
+    /// and leave decompression to libdeflate.
+    #[test]
+    fn compressed_block_is_not_detected_as_stored() {
+        let mut compressor = Compressor::new(CompressionLevel::new(6).unwrap());
+        let input = vec![b'A'; 4096]; // highly compressible => real deflate, not a stored block
+        let mut block = vec![];
+        compressor.compress(&input, &mut block).unwrap();
+
+        let deflate = &block[BGZF_HEADER_SIZE..block.len() - BGZF_FOOTER_SIZE];
+        assert!(stored_block_len(deflate).is_none());
+    }
+
+    /// The store-only writer must frame output as DEFLATE stored blocks, produce the same bytes
+    /// regardless of how writes are chunked across block boundaries, and round-trip.
+    #[test]
+    fn store_only_writer_emits_stored_blocks_across_chunked_writes() {
+        let input: Vec<u8> = (0..150_000u32).map(|i| i.wrapping_mul(2_654_435_761) as u8).collect();
+
+        let one_shot = {
+            let mut out = vec![];
+            let mut writer = Writer::new(&mut out, CompressionLevel::new(0).unwrap());
+            writer.write_all(&input).unwrap();
+            writer.finish().unwrap();
+            out
+        };
+        let chunked = {
+            let mut out = vec![];
+            let mut writer = Writer::new(&mut out, CompressionLevel::new(0).unwrap());
+            for chunk in input.chunks(7) {
+                writer.write_all(chunk).unwrap();
+            }
+            writer.finish().unwrap();
+            out
+        };
+
+        // Block boundaries depend only on the block size, so the framed output must be identical.
+        assert_eq!(one_shot, chunked, "chunked writes must produce identical framing");
+
+        // The first block must be a DEFLATE stored block...
+        let first_deflate =
+            &one_shot[BGZF_HEADER_SIZE..BGZF_HEADER_SIZE + DEFLATE_STORED_HEADER_SIZE];
+        assert!(stored_block_len(first_deflate).is_some(), "level 0 must emit stored blocks");
+
+        // ...and the whole thing must round-trip.
+        let mut decoded = vec![];
+        Reader::new(one_shot.as_slice()).read_to_end(&mut decoded).unwrap();
+        assert_eq!(decoded, input);
+    }
+
+    /// At level 0, writing no data must still produce exactly the EOF marker — never a spurious
+    /// empty stored block (guarded by `store_data_len > 0` in the writer's flush).
+    #[test]
+    fn store_only_empty_input_writes_only_eof() {
+        let mut out = vec![];
+        Writer::new(&mut out, CompressionLevel::new(0).unwrap()).finish().unwrap();
+        assert_eq!(out.as_slice(), BGZF_EOF);
+    }
+
+    /// Input that is an exact multiple of the block size must emit full blocks with no trailing
+    /// empty block, and still round-trip.
+    #[test]
+    fn store_only_exact_block_multiple_has_no_trailing_empty_block() {
+        let blocksize = 1024;
+        let input = vec![0x5Au8; blocksize * 3];
+
+        let mut out = vec![];
+        let mut writer =
+            Writer::with_capacity(&mut out, CompressionLevel::new(0).unwrap(), blocksize);
+        writer.write_all(&input).unwrap();
+        writer.finish().unwrap();
+
+        // Exactly three full stored blocks followed by the EOF marker — nothing else.
+        let block_bytes =
+            BGZF_HEADER_SIZE + DEFLATE_STORED_HEADER_SIZE + blocksize + BGZF_FOOTER_SIZE;
+        assert_eq!(out.len(), block_bytes * 3 + BGZF_EOF.len());
+
+        let mut decoded = vec![];
+        Reader::new(out.as_slice()).read_to_end(&mut decoded).unwrap();
+        assert_eq!(decoded, input);
+    }
+
+    /// At level 0, interleaving writes with `flush()` calls must still yield exactly one EOF
+    /// marker and round-trip to the concatenated input — each flush merely forces an earlier
+    /// block boundary, and a flush with nothing buffered emits no block.
+    #[test]
+    fn store_only_multiple_flush_single_eof_and_round_trips() {
+        let mut output = vec![];
+        {
+            let mut writer = Writer::new(&mut output, CompressionLevel::new(0).unwrap());
+            writer.write_all(b"hello ").unwrap();
+            writer.flush().unwrap();
+            writer.write_all(b"store-only ").unwrap();
+            writer.flush().unwrap();
+            writer.flush().unwrap(); // second consecutive flush must not emit an empty block
+            writer.write_all(b"world").unwrap();
+            writer.finish().unwrap();
+        }
+
+        let eof_count = output.windows(BGZF_EOF.len()).filter(|w| *w == BGZF_EOF).count();
+        assert_eq!(eof_count, 1, "EOF marker should appear exactly once across flushes");
+
+        let mut decoded = vec![];
+        Reader::new(output.as_slice()).read_to_end(&mut decoded).unwrap();
+        assert_eq!(decoded, b"hello store-only world");
+    }
+
+    /// At level 0 the EOF marker must be written exactly once when relying on Drop.
+    #[test]
+    fn store_only_eof_written_once_on_drop() {
+        let mut out = vec![];
+        {
+            let mut writer = Writer::new(&mut out, CompressionLevel::new(0).unwrap());
+            writer.write_all(b"some store-only data").unwrap();
+        }
+        assert!(out.ends_with(BGZF_EOF), "output should end with the EOF marker");
+        let eof_count = out.windows(BGZF_EOF.len()).filter(|w| *w == BGZF_EOF).count();
+        assert_eq!(eof_count, 1, "EOF marker should appear exactly once");
+    }
+
+    /// Assert that a reader error wraps a [`BgzfError`] matching `want`.
+    fn assert_bgzf_err(result: std::io::Result<usize>, want: impl Fn(&BgzfError) -> bool) {
+        let err = result.expect_err("expected an error");
+        let bgzf = err
+            .get_ref()
+            .and_then(|e| e.downcast_ref::<BgzfError>())
+            .expect("reader errors wrap a BgzfError");
+        assert!(want(bgzf), "unexpected error variant: {bgzf:?}");
+    }
+
+    /// With CRC validation disabled, a stored block whose footer CRC32 is corrupt must still be
+    /// read (the caller has opted out of integrity for speed); the default reader must reject it
+    /// specifically as a checksum failure.
+    #[test]
+    fn reader_can_skip_crc_validation_on_stored_blocks() {
+        let input = b"uncompressed payload bytes";
+        let mut blob = vec![];
+        let mut writer = Writer::new(&mut blob, CompressionLevel::new(0).unwrap());
+        writer.write_all(input).unwrap();
+        writer.finish().unwrap();
+
+        // Corrupt the first (only) data block's footer CRC32. Layout: header + stored framing +
+        // data + footer, with CRC32 as the first footer word.
+        let crc_off = BGZF_HEADER_SIZE + DEFLATE_STORED_HEADER_SIZE + input.len();
+        blob[crc_off] ^= 0x01;
+
+        let mut out = vec![];
+        assert_bgzf_err(Reader::new(blob.as_slice()).read_to_end(&mut out), |e| {
+            matches!(e, BgzfError::InvalidChecksum { .. })
+        });
+
+        let mut out = vec![];
+        Reader::new(blob.as_slice())
+            .with_crc_validation(false)
+            .read_to_end(&mut out)
+            .expect("validation disabled must accept the block");
+        assert_eq!(out, input);
+    }
+
+    /// CRC validation can also be skipped on the libdeflate (compressed) path.
+    #[test]
+    fn reader_can_skip_crc_validation_on_compressed_blocks() {
+        let input = vec![b'A'; 5000]; // compresses, so this is a real deflate block (not stored)
+        let mut blob = vec![];
+        let mut writer = Writer::new(&mut blob, CompressionLevel::new(6).unwrap());
+        writer.write_all(&input).unwrap();
+        writer.finish().unwrap();
+
+        // The block's footer precedes the 28-byte EOF marker; CRC32 is its first word.
+        let crc_off = blob.len() - BGZF_EOF.len() - BGZF_FOOTER_SIZE;
+        blob[crc_off] ^= 0x01;
+
+        let mut out = vec![];
+        assert_bgzf_err(Reader::new(blob.as_slice()).read_to_end(&mut out), |e| {
+            matches!(e, BgzfError::InvalidChecksum { .. })
+        });
+
+        let mut out = vec![];
+        Reader::new(blob.as_slice())
+            .with_crc_validation(false)
+            .read_to_end(&mut out)
+            .expect("validation disabled must accept the block");
+        assert_eq!(out, input);
+    }
+
+    /// Disabling CRC validation must NOT disable the cheap structural checks: a stream truncated
+    /// mid-block is still an error.
+    #[test]
+    fn truncated_block_errors_even_with_crc_validation_disabled() {
+        let input = vec![0x42u8; 1000];
+        let mut blob = vec![];
+        let mut writer = Writer::new(&mut blob, CompressionLevel::new(0).unwrap());
+        writer.write_all(&input).unwrap();
+        writer.finish().unwrap();
+
+        // Cut partway through the (single) data block, after its header but before its payload ends.
+        let truncated = &blob[..BGZF_HEADER_SIZE + DEFLATE_STORED_HEADER_SIZE + 100];
+        let mut out = vec![];
+        assert!(
+            Reader::new(truncated).with_crc_validation(false).read_to_end(&mut out).is_err(),
+            "a truncated block must error even with CRC validation off"
+        );
+    }
+
+    /// Disabling CRC validation must NOT disable the stored-block size check: a footer ISIZE that
+    /// disagrees with the DEFLATE LEN is still rejected.
+    #[test]
+    fn stored_isize_mismatch_errors_even_with_crc_validation_disabled() {
+        let input = vec![0x42u8; 1000];
+        let mut blob = vec![];
+        let mut writer = Writer::new(&mut blob, CompressionLevel::new(0).unwrap());
+        writer.write_all(&input).unwrap();
+        writer.finish().unwrap();
+
+        // Bump the footer's ISIZE so it no longer equals the stored block's LEN. ISIZE is the
+        // second footer word: header + stored framing + data + CRC32.
+        let isize_off =
+            BGZF_HEADER_SIZE + DEFLATE_STORED_HEADER_SIZE + input.len() + BGZF_SIZEOF_CRC32;
+        blob[isize_off] = blob[isize_off].wrapping_add(1);
+
+        let mut out = vec![];
+        assert_bgzf_err(
+            Reader::new(blob.as_slice()).with_crc_validation(false).read_to_end(&mut out),
+            |e| matches!(e, BgzfError::InvalidHeader(_)),
+        );
+    }
+
+    /// The CRC-off flag must persist across the whole read loop: a multi-block store-only stream
+    /// must round-trip with validation disabled.
+    #[test]
+    fn reader_skips_crc_across_multiple_blocks() {
+        // > 64 KiB at level 0 spans several stored blocks.
+        let input: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let mut blob = vec![];
+        let mut writer = Writer::new(&mut blob, CompressionLevel::new(0).unwrap());
+        writer.write_all(&input).unwrap();
+        writer.finish().unwrap();
+
+        let mut decoded = vec![];
+        Reader::new(blob.as_slice())
+            .with_crc_validation(false)
+            .read_to_end(&mut decoded)
+            .expect("multi-block stream must read with validation off");
+        assert_eq!(decoded, input);
+    }
+
+    /// The reader must round-trip multi-block store-only data, exercising the stored-block fast
+    /// path across several blocks.
+    #[test]
+    fn reader_round_trips_store_only_data() {
+        let input: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let mut blob = vec![];
+        let mut writer = Writer::new(&mut blob, CompressionLevel::new(0).unwrap());
+        writer.write_all(&input).unwrap();
+        writer.finish().unwrap();
+
+        let mut decoded = vec![];
+        Reader::new(blob.as_slice()).read_to_end(&mut decoded).unwrap();
+        assert_eq!(decoded, input);
+    }
+
     const DICT_SIZE: usize = 32768;
     proptest! {
         #[test]
@@ -545,7 +935,7 @@ mod test {
             input in prop::collection::vec(0..u8::MAX, 1..(DICT_SIZE * 10)),
             buf_size in DICT_SIZE..BGZF_BLOCK_SIZE,
             write_size in 1..BGZF_BLOCK_SIZE * 4,
-            comp_level in 1..12_u8
+            comp_level in 0..=12_u8
         ) {
             let dir = tempdir().unwrap();
 

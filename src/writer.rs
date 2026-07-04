@@ -6,9 +6,11 @@ use std::{
 };
 
 use bytes::BytesMut;
+use libdeflater::Crc;
 
 use crate::{
-    CompressionLevel, Compressor, BGZF_BLOCK_SIZE, BGZF_EOF, BUFSIZE, MAX_BGZF_BLOCK_SIZE,
+    header_inner, CompressionLevel, Compressor, BGZF_BLOCK_SIZE, BGZF_EOF, BGZF_FOOTER_SIZE,
+    BGZF_HEADER_SIZE, BGZF_SIZEOF_CRC32, BUFSIZE, DEFLATE_STORED_HEADER_SIZE, MAX_BGZF_BLOCK_SIZE,
 };
 
 /// A BGZF writer.
@@ -36,14 +38,24 @@ pub struct Writer<W>
 where
     W: Write,
 {
-    /// The internal buffer to use
+    /// Buffer of not-yet-compressed bytes (compress path only).
     uncompressed_buffer: BytesMut,
-    /// The buffer to reuse for compressed bytes
+    /// Reusable output buffer. On the compress path it holds one compressed block; on the
+    /// store-only path it holds a fully framed DEFLATE stored block assembled in place.
     compressed_buffer: Vec<u8>,
     /// The size of the blocks to create
     blocksize: usize,
-    /// The compressor to reuse
+    /// The compression level, also recorded in each block header.
+    level: CompressionLevel,
+    /// The compressor to reuse (unused on the store-only path).
     compressor: Compressor,
+    /// True at compression level 0: blocks are emitted as DEFLATE stored blocks without invoking
+    /// libdeflate, accumulating straight into `compressed_buffer`.
+    store_only: bool,
+    /// Running CRC32 over the bytes accumulated in the current store-only block.
+    store_crc: Crc,
+    /// Number of data bytes accumulated in the current store-only block.
+    store_data_len: usize,
     /// The inner writer, wrapped in Option to allow taking ownership in finish()
     writer: Option<W>,
 }
@@ -61,13 +73,28 @@ where
     ///
     /// By default the capacity is [`bgzf::BUFSIZE`]. The capacity must be less than or equal to [`bgzf::BGZF_BLOCK_SIZE`].
     pub fn with_capacity(writer: W, compression_level: CompressionLevel, blocksize: usize) -> Self {
-        assert!(blocksize <= BGZF_BLOCK_SIZE);
+        // A zero block size would loop forever while emitting blocks.
+        assert!(
+            (1..=BGZF_BLOCK_SIZE).contains(&blocksize),
+            "blocksize must be in 1..={BGZF_BLOCK_SIZE}"
+        );
         let compressor = Compressor::new(compression_level);
+        // Level 0 stores data uncompressed; assemble each framed block directly in this buffer.
+        let store_only = u8::from(compression_level) == 0;
+        let compressed_buffer = if store_only {
+            vec![0u8; BGZF_HEADER_SIZE + DEFLATE_STORED_HEADER_SIZE + blocksize + BGZF_FOOTER_SIZE]
+        } else {
+            Vec::with_capacity(BUFSIZE)
+        };
         Self {
             uncompressed_buffer: BytesMut::with_capacity(BUFSIZE),
-            compressed_buffer: Vec::with_capacity(BUFSIZE),
+            compressed_buffer,
             blocksize,
+            level: compression_level,
             compressor,
+            store_only,
+            store_crc: Crc::new(),
+            store_data_len: 0,
             writer: Some(writer),
         }
     }
@@ -89,6 +116,13 @@ where
 
     /// Internal method to flush the uncompressed buffer without writing EOF.
     fn flush_buffer(&mut self) -> io::Result<()> {
+        if self.store_only {
+            // Emit whatever partial block has accumulated; an empty block is never written.
+            if self.store_data_len > 0 {
+                self.emit_store_block()?;
+            }
+            return Ok(());
+        }
         let writer = self
             .writer
             .as_mut()
@@ -104,6 +138,61 @@ where
             writer.write_all(&self.compressed_buffer)?;
             self.compressed_buffer.clear();
         }
+        Ok(())
+    }
+
+    /// Accumulate `buf` into the current store-only block, emitting full blocks as they fill.
+    fn write_store_only(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let data_offset = BGZF_HEADER_SIZE + DEFLATE_STORED_HEADER_SIZE;
+        let mut remaining = buf;
+        while !remaining.is_empty() {
+            let n = (self.blocksize - self.store_data_len).min(remaining.len());
+            let start = data_offset + self.store_data_len;
+            self.compressed_buffer[start..start + n].copy_from_slice(&remaining[..n]);
+            self.store_crc.update(&remaining[..n]);
+            self.store_data_len += n;
+            remaining = &remaining[n..];
+            if self.store_data_len == self.blocksize {
+                self.emit_store_block()?;
+            }
+        }
+        Ok(buf.len())
+    }
+
+    /// Frame the data accumulated in `compressed_buffer` as a single DEFLATE stored block, write
+    /// it to the inner writer, and reset for the next block.
+    fn emit_store_block(&mut self) -> io::Result<()> {
+        let data_len = self.store_data_len;
+        let data_offset = BGZF_HEADER_SIZE + DEFLATE_STORED_HEADER_SIZE;
+
+        // BGZF header. A stored block's "compressed" size is its 5-byte DEFLATE header plus data.
+        let header = header_inner(self.level, (DEFLATE_STORED_HEADER_SIZE + data_len) as u16);
+        self.compressed_buffer[..BGZF_HEADER_SIZE].copy_from_slice(&header);
+
+        // DEFLATE stored-block header: BFINAL=1, BTYPE=00, then LEN and its complement NLEN.
+        let len = data_len as u16;
+        self.compressed_buffer[BGZF_HEADER_SIZE] = 0b001;
+        self.compressed_buffer[BGZF_HEADER_SIZE + 1..BGZF_HEADER_SIZE + 3]
+            .copy_from_slice(&len.to_le_bytes());
+        self.compressed_buffer[BGZF_HEADER_SIZE + 3..BGZF_HEADER_SIZE + 5]
+            .copy_from_slice(&(!len).to_le_bytes());
+
+        // BGZF footer: CRC32 of the data followed by the uncompressed size.
+        let footer_offset = data_offset + data_len;
+        self.compressed_buffer[footer_offset..footer_offset + BGZF_SIZEOF_CRC32]
+            .copy_from_slice(&self.store_crc.sum().to_le_bytes());
+        self.compressed_buffer[footer_offset + BGZF_SIZEOF_CRC32..footer_offset + BGZF_FOOTER_SIZE]
+            .copy_from_slice(&(data_len as u32).to_le_bytes());
+
+        let end = footer_offset + BGZF_FOOTER_SIZE;
+        let writer = self
+            .writer
+            .as_mut()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "writer already finished"))?;
+        writer.write_all(&self.compressed_buffer[..end])?;
+
+        self.store_crc = Crc::new();
+        self.store_data_len = 0;
         Ok(())
     }
 }
@@ -138,6 +227,12 @@ where
 {
     /// Write a buffer into this writer, returning how many bytes were written.
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.store_only {
+            if self.writer.is_none() {
+                return Err(io::Error::new(io::ErrorKind::Other, "writer already finished"));
+            }
+            return self.write_store_only(buf);
+        }
         let writer = self
             .writer
             .as_mut()
