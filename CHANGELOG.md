@@ -14,8 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `std::io::Read`/`Write` (and `BufRead`) interfaces as the single-threaded types. Decompressed
   output is byte-identical to `Reader`, and compressed output is byte-identical to `Writer`, at
   every worker count. The feature name distinguishes this per-instance model from a future
-  `multithreading-pooled` feature (one thread pool shared across many readers/writers). Adds an
-  optional `crossbeam-channel` dependency; the default build is unchanged.
+  `multithreading-pooled` feature (one thread pool shared across many readers/writers). Adds
+  optional `crossbeam-channel` (pool queues) and `oneshot` (per-block result handoff)
+  dependencies; the default build is unchanged.
   - Read-ahead/write-ahead depth is decoupled from worker count (channels and the recycled-buffer
     pool are sized to `worker_count.max(8)`), so a single-worker instance still pipelines instead
     of stalling on a synchronous per-block handoff.

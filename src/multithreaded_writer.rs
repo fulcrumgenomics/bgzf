@@ -41,12 +41,13 @@ use crate::{BgzfError, CompressionLevel, Compressor, BGZF_BLOCK_SIZE, BGZF_EOF};
 /// `MIN_BUFFERS` for the rationale (a single-worker writer must still pipeline).
 const MIN_BUFFERS: usize = 8;
 
-// A per-block "one-shot": a worker sends the framed, compressed block (or a compression
-// error) back on it, and the writer thread — holding the matching receiver, pulled in
-// submission order — waits on it.
+// A per-block "one-shot": a worker sends the framed, compressed block (or a compression error)
+// back on it, and the writer thread — holding the matching receiver, pulled in submission order —
+// waits on it. A purpose-built single-message `oneshot` channel is cheaper here than a general
+// MPMC `bounded(1)`.
 type Compressed = io::Result<Vec<u8>>;
-type CompressedTx = Sender<Compressed>;
-type CompressedRx = Receiver<Compressed>;
+type CompressedTx = oneshot::Sender<Compressed>;
+type CompressedRx = oneshot::Receiver<Compressed>;
 // Caller → workers: the uncompressed block plus the one-shot to answer on.
 type DeflateTx = Sender<(Bytes, CompressedTx)>;
 type DeflateRx = Receiver<(Bytes, CompressedTx)>;
@@ -187,7 +188,7 @@ where
         };
 
         let data = self.buf.split().freeze();
-        let (compressed_tx, compressed_rx) = bounded::<Compressed>(1);
+        let (compressed_tx, compressed_rx) = oneshot::channel::<Compressed>();
         deflate_tx
             .send((data, compressed_tx))
             .map_err(|_| io::Error::new(io::ErrorKind::Other, "bgzf writer pipeline stopped"))?;

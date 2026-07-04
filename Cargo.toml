@@ -23,16 +23,18 @@ libdeflater = "1.0"
 thiserror = "1.0"
 
 # Channels for the per-instance multithreaded reader/writer. Optional: only the
-# `multithreading-simple` feature pulls it in, so the default build stays lean.
-# Narrowest sensible feature set: `std` is the only feature we need (and its only
-# non-trivial one) — the channels are thread-parking based, so `no_std` is a non-starter.
+# `multithreading-simple` feature pulls them in, so the default build stays lean.
+# Narrowest sensible feature set: `std` (thread-parking blocking recv) only.
+# crossbeam-channel carries the pool's MPMC channels; `oneshot` is a purpose-built,
+# cheaper single-message channel for the per-block result handoff.
 crossbeam-channel = { version = "0.5", default-features = false, features = ["std"], optional = true }
+oneshot = { version = "0.2", default-features = false, features = ["std"], optional = true }
 
 [features]
 # Each `MultithreadedReader`/`MultithreadedWriter` owns a dedicated pool of worker
 # threads (as opposed to a future `multithreading-pooled` feature that would share
 # one thread pool across many readers/writers).
-multithreading-simple = ["dep:crossbeam-channel"]
+multithreading-simple = ["dep:crossbeam-channel", "dep:oneshot"]
 
 [dev-dependencies]
 criterion = "0.5"

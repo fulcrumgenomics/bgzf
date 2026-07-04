@@ -8,7 +8,8 @@
 //!
 //! # Design
 //!
-//! Three roles connected by `crossbeam-channel` channels, modelled on noodles-bgzf's
+//! Three roles connected by channels — `crossbeam-channel` for the pool's MPMC queues and a
+//! purpose-built `oneshot` per block for the result handoff — modelled on noodles-bgzf's
 //! `MultithreadedReader` but using this crate's block internals:
 //!
 //! - **Reader thread** — reads raw blocks (header + payload + footer) in file order,
@@ -71,11 +72,12 @@ struct Buffer {
     pos: usize,
 }
 
-// A per-block "one-shot": the worker sends the decoded (or failed) buffer back on it, and
-// the consumer — holding the matching receiver, pulled in file order — waits on it.
+// A per-block "one-shot": the worker sends the decoded (or failed) buffer back on it, and the
+// consumer — holding the matching receiver, pulled in file order — waits on it. A purpose-built
+// single-message `oneshot` channel is cheaper here than a general MPMC `bounded(1)`.
 type Decoded = io::Result<Buffer>;
-type DecodedTx = Sender<Decoded>;
-type DecodedRx = Receiver<Decoded>;
+type DecodedTx = oneshot::Sender<Decoded>;
+type DecodedRx = oneshot::Receiver<Decoded>;
 // Reader → workers: a raw block plus the one-shot to answer on.
 type InflateTx = Sender<(Buffer, DecodedTx)>;
 type InflateRx = Receiver<(Buffer, DecodedTx)>;
@@ -300,7 +302,7 @@ where
             match read_raw_block(&mut reader, &mut buffer) {
                 Ok(false) => break, // clean end of stream at a block boundary
                 Ok(true) => {
-                    let (decoded_tx, decoded_rx) = bounded::<Decoded>(1);
+                    let (decoded_tx, decoded_rx) = oneshot::channel::<Decoded>();
                     // Dispatch to a worker, then register the slot with the consumer. If
                     // either channel is closed we are shutting down, so stop.
                     if inflate_tx.send((buffer, decoded_tx)).is_err()
@@ -311,7 +313,7 @@ where
                 }
                 Err(e) => {
                     // Surface the error to the consumer in order, then stop.
-                    let (decoded_tx, decoded_rx) = bounded::<Decoded>(1);
+                    let (decoded_tx, decoded_rx) = oneshot::channel::<Decoded>();
                     decoded_tx.send(Err(e)).ok();
                     order_tx.send(decoded_rx).ok();
                     break;
