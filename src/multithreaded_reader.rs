@@ -49,6 +49,24 @@ use crate::{
 /// `worker_count.max(MIN_BUFFERS)` so even a single-worker reader reads ahead.
 const MIN_BUFFERS: usize = 8;
 
+// Channel type aliases. The unit of work moved across them is a [`Buffer`] (defined below).
+//
+// A per-block "one-shot": the worker sends the decoded (or failed) buffer back on it, and the
+// consumer — holding the matching receiver, pulled in file order — waits on it. A purpose-built
+// single-message `oneshot` channel is cheaper here than a general MPMC `bounded(1)`.
+type Decoded = io::Result<Buffer>;
+type DecodedTx = oneshot::Sender<Decoded>;
+type DecodedRx = oneshot::Receiver<Decoded>;
+// Reader → workers: a raw block plus the one-shot to answer on.
+type InflateTx = Sender<(Buffer, DecodedTx)>;
+type InflateRx = Receiver<(Buffer, DecodedTx)>;
+// Reader → consumer: the one-shot receivers, in file order.
+type OrderTx = Sender<DecodedRx>;
+type OrderRx = Receiver<DecodedRx>;
+// Consumer → reader: spent buffers to reuse.
+type RecycleTx = Sender<Buffer>;
+type RecycleRx = Receiver<Buffer>;
+
 /// A recycled unit of work that cycles reader → worker → consumer → reader with no per-block
 /// allocation.
 ///
@@ -72,22 +90,6 @@ struct Buffer {
     pos: usize,
 }
 
-// A per-block "one-shot": the worker sends the decoded (or failed) buffer back on it, and the
-// consumer — holding the matching receiver, pulled in file order — waits on it. A purpose-built
-// single-message `oneshot` channel is cheaper here than a general MPMC `bounded(1)`.
-type Decoded = io::Result<Buffer>;
-type DecodedTx = oneshot::Sender<Decoded>;
-type DecodedRx = oneshot::Receiver<Decoded>;
-// Reader → workers: a raw block plus the one-shot to answer on.
-type InflateTx = Sender<(Buffer, DecodedTx)>;
-type InflateRx = Receiver<(Buffer, DecodedTx)>;
-// Reader → consumer: the one-shot receivers, in file order.
-type OrderTx = Sender<DecodedRx>;
-type OrderRx = Receiver<DecodedRx>;
-// Consumer → reader: spent buffers to reuse.
-type RecycleTx = Sender<Buffer>;
-type RecycleRx = Receiver<Buffer>;
-
 enum State<R> {
     Running {
         reader_handle: JoinHandle<R>,
@@ -101,7 +103,7 @@ enum State<R> {
 /// A multithreaded BGZF reader.
 ///
 /// Decompresses blocks on a dedicated pool of worker threads while exposing a sequential
-/// [`Read`]/[`BufRead`] interface. See the [module docs](self) for the design.
+/// [`Read`]/[`BufRead`] interface. See the module-level documentation for the design.
 ///
 /// The worker threads are joined when the reader is dropped; call [`finish`](Self::finish)
 /// instead if you need to observe reader-thread panics or reclaim the inner reader.
@@ -140,7 +142,7 @@ where
     /// Create a reader with the given number of inflater worker threads.
     ///
     /// The read-ahead depth is `worker_count.max(8)` regardless of `worker_count`, so a
-    /// single-worker reader still reads ahead (see the [module docs](self)).
+    /// single-worker reader still reads ahead (see the module-level documentation).
     pub fn with_worker_count(worker_count: NonZero<usize>, inner: R) -> Self {
         let capacity = worker_count.get().max(MIN_BUFFERS);
 
@@ -221,6 +223,13 @@ where
     }
 }
 
+impl MultithreadedReader<std::fs::File> {
+    /// Create a multithreaded reader over a file at `path`.
+    pub fn from_path<P: AsRef<std::path::Path>>(path: P) -> io::Result<Self> {
+        std::fs::File::open(path).map(Self::new)
+    }
+}
+
 impl<R> Read for MultithreadedReader<R>
 where
     R: Read + Send + 'static,
@@ -265,13 +274,6 @@ where
         if matches!(self.state, State::Running { .. }) {
             let _ = self.finish();
         }
-    }
-}
-
-impl MultithreadedReader<std::fs::File> {
-    /// Create a multithreaded reader over a file at `path`.
-    pub fn from_path<P: AsRef<std::path::Path>>(path: P) -> io::Result<Self> {
-        std::fs::File::open(path).map(Self::new)
     }
 }
 

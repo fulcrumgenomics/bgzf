@@ -2,8 +2,10 @@
 name = "bgzf"
 version = "0.4.0"
 edition = "2021"
+rust-version = "1.85"
 authors = [
-    "Seth Stadick <seth@fulcrumgenomics.com>"
+    "Seth Stadick <seth@fulcrumgenomics.com>",
+    "Tim Fennell <tim@fulcrumgenomics.com>"
 ]
 license = "MIT"
 readme = "README.md"
@@ -49,3 +51,9 @@ harness = false
 name = "multithreaded"
 harness = false
 required-features = ["multithreading-simple"]
+
+# Build docs on docs.rs with all features so the feature-gated multithreaded types are
+# documented, and enable the `doc_cfg` feature badges (see `#![cfg_attr(docsrs, ...)]` in lib.rs).
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

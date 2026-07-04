@@ -20,7 +20,17 @@
 //!     Ok(())
 //! }
 //! ```
+//!
+//! # Multithreading
+//!
+//! The [`Reader`] and [`Writer`] above are single-threaded. Enabling the optional
+//! `multithreading-simple` feature adds `MultithreadedReader` and `MultithreadedWriter`, which
+//! (de)compress blocks in parallel on a dedicated pool of worker threads while preserving block
+//! order, exposing the same [`std::io::Read`]/[`std::io::Write`] interfaces. Each reader/writer
+//! owns its own worker threads — hence *simple* — as distinguished from a possible future
+//! `multithreading-pooled` feature that would share one thread pool across many readers/writers.
 #![deny(unsafe_code)]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![allow(clippy::must_use_candidate, clippy::missing_errors_doc, clippy::missing_panics_doc)]
 
 // Re-export the reader and writer to the same level.
@@ -37,8 +47,10 @@ mod multithreaded_reader;
 #[cfg(feature = "multithreading-simple")]
 mod multithreaded_writer;
 #[cfg(feature = "multithreading-simple")]
+#[cfg_attr(docsrs, doc(cfg(feature = "multithreading-simple")))]
 pub use multithreaded_reader::*;
 #[cfg(feature = "multithreading-simple")]
+#[cfg_attr(docsrs, doc(cfg(feature = "multithreading-simple")))]
 pub use multithreaded_writer::*;
 
 use std::io;

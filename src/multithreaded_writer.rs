@@ -68,7 +68,7 @@ enum State<W> {
 /// A multithreaded BGZF writer.
 ///
 /// Compresses blocks on a dedicated pool of worker threads while writing them, in order, to
-/// the inner writer. See the [module docs](self) for the design.
+/// the inner writer. See the module-level documentation for the design.
 ///
 /// # Finishing
 ///
@@ -199,6 +199,16 @@ where
     }
 }
 
+impl MultithreadedWriter<std::fs::File> {
+    /// Create a multithreaded writer over a new file at `path`.
+    pub fn from_path<P: AsRef<std::path::Path>>(
+        path: P,
+        compression_level: CompressionLevel,
+    ) -> io::Result<Self> {
+        std::fs::File::create(path).map(|f| Self::new(f, compression_level))
+    }
+}
+
 impl<W> Write for MultithreadedWriter<W>
 where
     W: Write + Send + 'static,
@@ -228,16 +238,6 @@ where
         if matches!(self.state, State::Running { .. }) {
             let _ = self.finish();
         }
-    }
-}
-
-impl MultithreadedWriter<std::fs::File> {
-    /// Create a multithreaded writer over a new file at `path`.
-    pub fn from_path<P: AsRef<std::path::Path>>(
-        path: P,
-        compression_level: CompressionLevel,
-    ) -> io::Result<Self> {
-        std::fs::File::create(path).map(|f| Self::new(f, compression_level))
     }
 }
 
