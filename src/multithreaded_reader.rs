@@ -8,7 +8,7 @@
 //!
 //! # Design
 //!
-//! Three roles connected by [`kanal`] channels, modelled on noodles-bgzf's
+//! Three roles connected by `crossbeam-channel` channels, modelled on noodles-bgzf's
 //! `MultithreadedReader` but using this crate's block internals:
 //!
 //! - **Reader thread** — reads raw blocks (header + payload + footer) in file order,
@@ -35,7 +35,7 @@ use std::io::{self, BufRead, Read};
 use std::num::NonZero;
 use std::thread::{self, JoinHandle};
 
-use kanal::{bounded, Receiver, Sender};
+use crossbeam_channel::{bounded, Receiver, Sender};
 
 use crate::reader::read_full;
 use crate::{

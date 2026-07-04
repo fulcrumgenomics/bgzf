@@ -24,13 +24,15 @@ thiserror = "1.0"
 
 # Channels for the per-instance multithreaded reader/writer. Optional: only the
 # `multithreading-simple` feature pulls it in, so the default build stays lean.
-kanal = { version = "0.1.1", optional = true }
+# Narrowest sensible feature set: `std` is the only feature we need (and its only
+# non-trivial one) — the channels are thread-parking based, so `no_std` is a non-starter.
+crossbeam-channel = { version = "0.5", default-features = false, features = ["std"], optional = true }
 
 [features]
 # Each `MultithreadedReader`/`MultithreadedWriter` owns a dedicated pool of worker
 # threads (as opposed to a future `multithreading-pooled` feature that would share
 # one thread pool across many readers/writers).
-multithreading-simple = ["dep:kanal"]
+multithreading-simple = ["dep:crossbeam-channel"]
 
 [dev-dependencies]
 criterion = "0.5"

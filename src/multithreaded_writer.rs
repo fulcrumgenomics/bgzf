@@ -33,7 +33,7 @@ use std::num::NonZero;
 use std::thread::{self, JoinHandle};
 
 use bytes::{Bytes, BytesMut};
-use kanal::{bounded, Receiver, Sender};
+use crossbeam_channel::{bounded, Receiver, Sender};
 
 use crate::{BgzfError, CompressionLevel, Compressor, BGZF_BLOCK_SIZE, BGZF_EOF};
 
