@@ -43,9 +43,12 @@ bgzf = { version = "0.4", features = ["multithreading-simple"] }
 ```
 
 ```rust
+use std::fs::File;
 use std::num::NonZero;
 use bgzf::MultithreadedReader;
 
+// The inner reader is any `Read + Send + 'static` source — here, a BGZF file on disk.
+let input = File::open("example.bgzf")?;
 let reader = MultithreadedReader::with_worker_count(NonZero::new(4).unwrap(), input);
 ```
 
