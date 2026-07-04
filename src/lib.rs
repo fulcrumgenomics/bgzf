@@ -588,8 +588,8 @@ mod test {
     }
 
     /// A block whose footer ISIZE claims more uncompressed bytes than the DEFLATE
-    /// payload actually produces must be rejected as corrupt — never read past the
-    /// region the decompressor initialized (which the reader now leaves uninitialized).
+    /// payload actually produces must be rejected as corrupt, rather than serving the
+    /// stale bytes left in the reader's reused decompression buffer from a prior block.
     #[test]
     fn block_claiming_more_bytes_than_payload_is_rejected() {
         let mut compressor = Compressor::new(CompressionLevel::new(3).unwrap());
@@ -747,6 +747,31 @@ mod test {
         let mut decoded = vec![];
         Reader::new(out.as_slice()).read_to_end(&mut decoded).unwrap();
         assert_eq!(decoded, input);
+    }
+
+    /// At level 0, interleaving writes with `flush()` calls must still yield exactly one EOF
+    /// marker and round-trip to the concatenated input — each flush merely forces an earlier
+    /// block boundary, and a flush with nothing buffered emits no block.
+    #[test]
+    fn store_only_multiple_flush_single_eof_and_round_trips() {
+        let mut output = vec![];
+        {
+            let mut writer = Writer::new(&mut output, CompressionLevel::new(0).unwrap());
+            writer.write_all(b"hello ").unwrap();
+            writer.flush().unwrap();
+            writer.write_all(b"store-only ").unwrap();
+            writer.flush().unwrap();
+            writer.flush().unwrap(); // second consecutive flush must not emit an empty block
+            writer.write_all(b"world").unwrap();
+            writer.finish().unwrap();
+        }
+
+        let eof_count = output.windows(BGZF_EOF.len()).filter(|w| *w == BGZF_EOF).count();
+        assert_eq!(eof_count, 1, "EOF marker should appear exactly once across flushes");
+
+        let mut decoded = vec![];
+        Reader::new(output.as_slice()).read_to_end(&mut decoded).unwrap();
+        assert_eq!(decoded, b"hello store-only world");
     }
 
     /// At level 0 the EOF marker must be written exactly once when relying on Drop.
