@@ -58,6 +58,10 @@ where
     store_data_len: usize,
     /// The inner writer, wrapped in Option to allow taking ownership in finish()
     writer: Option<W>,
+    /// Set to true once any write or flush to the inner writer has failed. A poisoned writer
+    /// refuses further writes, and — crucially — its `Drop` will not re-enter the (already broken,
+    /// possibly blocking) sink to flush buffered blocks or emit the EOF marker.
+    poisoned: bool,
 }
 
 impl<W> Writer<W>
@@ -97,6 +101,7 @@ where
             store_crc: Crc::new(),
             store_data_len: 0,
             writer: Some(writer),
+            poisoned: false,
         }
     }
 
@@ -108,10 +113,19 @@ where
     /// the EOF marker will be written when the writer is dropped, but any
     /// errors will be silently ignored.
     pub fn finish(mut self) -> io::Result<W> {
+        // A prior write/flush already broke the sink; do not re-enter it to flush buffered blocks
+        // or write EOF — that would write onto a dead stream and, for a sink that blocks after
+        // failing, deadlock here. Returning early leaves `self.writer` set and `poisoned` true, so
+        // the ensuing Drop also skips finalization.
+        if self.poisoned {
+            return Err(poisoned_error());
+        }
         self.flush_buffer()?;
         let mut writer = self.writer.take().expect("writer already taken");
-        writer.write_all(BGZF_EOF)?;
-        writer.flush()?;
+        if let Err(e) = writer.write_all(BGZF_EOF).and_then(|()| writer.flush()) {
+            self.poisoned = true;
+            return Err(e);
+        }
         Ok(writer)
     }
 
@@ -136,7 +150,10 @@ where
             self.compressor
                 .compress(&b[..], &mut self.compressed_buffer)
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-            writer.write_all(&self.compressed_buffer)?;
+            if let Err(e) = writer.write_all(&self.compressed_buffer) {
+                self.poisoned = true;
+                return Err(e);
+            }
             self.compressed_buffer.clear();
         }
         Ok(())
@@ -190,7 +207,10 @@ where
             .writer
             .as_mut()
             .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "writer already finished"))?;
-        writer.write_all(&self.compressed_buffer[..end])?;
+        if let Err(e) = writer.write_all(&self.compressed_buffer[..end]) {
+            self.poisoned = true;
+            return Err(e);
+        }
 
         self.store_crc = Crc::new();
         self.store_data_len = 0;
@@ -228,6 +248,11 @@ where
 {
     /// Write a buffer into this writer, returning how many bytes were written.
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // A prior write/flush already failed; refuse to buffer more rather than accumulate data
+        // that can never be flushed (Drop deliberately skips a poisoned sink).
+        if self.poisoned {
+            return Err(poisoned_error());
+        }
         if self.store_only {
             if self.writer.is_none() {
                 return Err(io::Error::new(io::ErrorKind::Other, "writer already finished"));
@@ -244,7 +269,10 @@ where
             self.compressor
                 .compress(&b[..], &mut self.compressed_buffer)
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-            writer.write_all(&self.compressed_buffer)?;
+            if let Err(e) = writer.write_all(&self.compressed_buffer) {
+                self.poisoned = true;
+                return Err(e);
+            }
             self.compressed_buffer.clear();
         }
         Ok(buf.len())
@@ -255,9 +283,15 @@ where
     /// Note: This does NOT write the BGZF EOF marker. Call [`Writer::finish`] when
     /// you are done writing to properly finalize the BGZF file.
     fn flush(&mut self) -> std::io::Result<()> {
+        if self.poisoned {
+            return Err(poisoned_error());
+        }
         self.flush_buffer()?;
         if let Some(writer) = self.writer.as_mut() {
-            writer.flush()?;
+            if let Err(e) = writer.flush() {
+                self.poisoned = true;
+                return Err(e);
+            }
         }
         Ok(())
     }
@@ -268,15 +302,29 @@ where
     W: Write,
 {
     fn drop(&mut self) {
-        // Only write EOF if finish() wasn't called (writer is still Some)
-        if self.writer.is_some() {
-            // Flush buffer first (this borrows self mutably)
-            let _ = self.flush_buffer();
-            // Now we can borrow writer
-            if let Some(ref mut writer) = self.writer {
-                let _ = writer.write_all(BGZF_EOF);
-                let _ = writer.flush();
-            }
+        // Finalize only a healthy, un-finished writer. If `finish()` already took the writer, or a
+        // prior write/flush poisoned it, there is nothing to finalize: re-entering an already
+        // broken sink would write an EOF marker onto a dead stream, silently swallow the resulting
+        // error, and — for a sink that blocks after failing — deadlock here during unwinding.
+        if self.writer.is_none() || self.poisoned {
+            return;
+        }
+        // Flush buffer first (this borrows self mutably). If it fails it poisons the writer, so
+        // re-check before re-entering the sink to write EOF — otherwise a sink that broke mid-flush
+        // would be re-entered here.
+        let _ = self.flush_buffer();
+        if self.poisoned {
+            return;
+        }
+        if let Some(ref mut writer) = self.writer {
+            let _ = writer.write_all(BGZF_EOF);
+            let _ = writer.flush();
         }
     }
+}
+
+/// The error returned when a write or flush is attempted on a writer whose inner sink already
+/// failed. The writer cannot recover — its buffered block state is inconsistent — so it fails fast.
+fn poisoned_error() -> io::Error {
+    io::Error::new(io::ErrorKind::Other, "bgzf writer poisoned by an earlier write failure")
 }
