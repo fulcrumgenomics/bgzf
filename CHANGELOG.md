@@ -13,6 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of wrapping the reader in a `BufReader` (which would redundantly re-buffer already
   decompressed bytes).
 
+### Fixed
+- `Writer` no longer re-enters an already-failed sink when finalizing. Previously, once a `write` or `flush` had failed (e.g. the sink returned `BrokenPipe`), a subsequent `Drop` or `finish()` would still try to flush buffered blocks and write the BGZF EOF marker onto the broken stream — swallowing the error (silent truncation for code relying on `Drop`), and, for a sink that blocks after failing, deadlocking. `Writer` now tracks a poisoned state: `write`/`flush` fail fast once the sink has failed, and `finish()`/`Drop` skip all finalization instead of re-entering it. The healthy path is unchanged — a normal writer still emits the EOF marker exactly once.
+
 ## [0.4.0] - 2026-07-04
 
 ### Added

@@ -485,6 +485,57 @@ mod tests {
         assert_eq!(decode(&compressed), input);
     }
 
+    /// Dropping the writer after its sink has failed must return promptly, never re-entering (and
+    /// so never hanging on) the broken sink. Unlike the single-threaded `Writer`, this falls out of
+    /// the architecture for free: the sink lives on the writer thread, which drops it the instant a
+    /// write errors, and `Drop` only joins threads — it never touches the sink. This test guards
+    /// that property against a future refactor that reintroduces sink access on the finalize path.
+    #[test]
+    fn drop_returns_promptly_after_sink_failure() {
+        // Fails its first write, then parks forever on any later call. If `Drop` re-entered the
+        // sink after the failure, the join in `finish` would deadlock on that park.
+        struct FailThenBlockSink {
+            writes: usize,
+        }
+        impl Write for FailThenBlockSink {
+            fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+                self.writes += 1;
+                if self.writes == 1 {
+                    return Err(io::Error::new(io::ErrorKind::BrokenPipe, "broken pipe"));
+                }
+                loop {
+                    thread::park();
+                }
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                loop {
+                    thread::park();
+                }
+            }
+        }
+
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut writer = MultithreadedWriter::with_capacity(
+                NonZero::new(2).unwrap(),
+                FailThenBlockSink { writes: 0 },
+                level(6),
+                1024,
+            );
+            let _ = writer.write_all(&[b'A'; 4096]);
+            drop(writer);
+            let _ = tx.send(());
+        });
+
+        assert!(
+            rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "MultithreadedWriter::drop hung after the sink failed"
+        );
+    }
+
     use proptest::prelude::*;
 
     proptest! {

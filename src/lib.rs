@@ -811,6 +811,106 @@ mod test {
         assert_eq!(eof_count, 1, "EOF marker should appear exactly once");
     }
 
+    /// A sink that fails its first `write` with `BrokenPipe` and then blocks forever on any later
+    /// call — modelling a buffered sink that deadlocks if re-entered after returning an error. Used
+    /// to prove `Writer::drop` does not re-enter a sink that has already failed.
+    struct FailThenBlockSink {
+        writes: usize,
+    }
+
+    impl Write for FailThenBlockSink {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            self.writes += 1;
+            if self.writes == 1 {
+                return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "broken pipe"));
+            }
+            // Any re-entry after the failure parks forever; a loop guards spurious wake-ups.
+            loop {
+                std::thread::park();
+            }
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            loop {
+                std::thread::park();
+            }
+        }
+    }
+
+    /// Drive `writer` until a block is emitted (surfacing the sink's `BrokenPipe`), then run
+    /// `finalize` on it on a worker thread. Returns whether finalization completed within the
+    /// watchdog window — `false` means it re-entered the now-blocking sink and hung. Covers both
+    /// finalization paths that could re-enter the sink: `Drop` and `finish`.
+    fn finalize_returns_after_sink_failure(
+        mut writer: Writer<FailThenBlockSink>,
+        finalize: impl FnOnce(Writer<FailThenBlockSink>) + Send + 'static,
+    ) -> bool {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            // Several blocks' worth of data: emitting the first block hits the sink, which fails
+            // and leaves later blocks still buffered.
+            let err = writer.write_all(&[b'A'; 4096]).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+            // Finalizing the now-poisoned writer must NOT re-enter the blocking sink.
+            finalize(writer);
+            let _ = tx.send(());
+        });
+
+        rx.recv_timeout(Duration::from_secs(5)).is_ok()
+    }
+
+    /// On the compress path, dropping a writer whose sink already failed must return immediately
+    /// rather than re-entering the broken (and here, blocking) sink to flush blocks and write EOF.
+    #[test]
+    fn drop_does_not_reenter_a_failed_sink() {
+        // Small block size so a modest write forces a block emission, and thus a sink write.
+        let writer = Writer::with_capacity(
+            FailThenBlockSink { writes: 0 },
+            CompressionLevel::new(6).unwrap(),
+            1024,
+        );
+        assert!(
+            finalize_returns_after_sink_failure(writer, drop),
+            "Writer::drop re-entered a broken sink and hung"
+        );
+    }
+
+    /// The store-only (level 0) path emits blocks through a separate code path; its `Drop` must be
+    /// equally defensive about not re-entering a sink that has already failed.
+    #[test]
+    fn store_only_drop_does_not_reenter_a_failed_sink() {
+        let writer = Writer::with_capacity(
+            FailThenBlockSink { writes: 0 },
+            CompressionLevel::new(0).unwrap(),
+            1024,
+        );
+        assert!(
+            finalize_returns_after_sink_failure(writer, drop),
+            "store-only Writer::drop re-entered a broken sink and hung"
+        );
+    }
+
+    /// Calling `finish()` after a write already failed is a plausible best-effort cleanup pattern;
+    /// like `Drop`, it must not re-enter the broken (blocking) sink to flush blocks or write EOF.
+    #[test]
+    fn finish_does_not_reenter_a_failed_sink() {
+        let writer = Writer::with_capacity(
+            FailThenBlockSink { writes: 0 },
+            CompressionLevel::new(6).unwrap(),
+            1024,
+        );
+        assert!(
+            finalize_returns_after_sink_failure(writer, |w| {
+                // finish() consumes the writer; the returned error is expected and ignored here.
+                let _ = w.finish();
+            }),
+            "Writer::finish re-entered a broken sink and hung"
+        );
+    }
+
     /// Assert that a reader error wraps a [`BgzfError`] matching `want`.
     fn assert_bgzf_err(result: std::io::Result<usize>, want: impl Fn(&BgzfError) -> bool) {
         let err = result.expect_err("expected an error");
