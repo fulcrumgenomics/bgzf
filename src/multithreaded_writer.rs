@@ -159,20 +159,36 @@ where
     /// `Drop` path would silently swallow, and guarantees the EOF marker is written exactly
     /// once.
     pub fn finish(&mut self) -> io::Result<W> {
-        if !self.buf.is_empty() {
-            self.send()?;
-        }
+        // Dispatch any final buffered block, but do NOT bail out on failure: a failed dispatch
+        // means the pipeline has already broken, and the writer thread holds the *real* error
+        // (e.g. the underlying I/O failure). We always drain and join every thread below — both to
+        // surface that error and to leave the writer in the `Done` state, so a later `Drop` can't
+        // silently re-run finalization and swallow it.
+        let send_result = self.send();
+
         match std::mem::replace(&mut self.state, State::Done) {
             State::Running { writer_handle, mut deflater_handles, deflate_tx, order_tx } => {
-                // Close the deflater input so workers finish once they have drained it, then
-                // join them. Closing the order channel afterwards lets the writer thread
-                // drain its queue, append EOF, and return the inner writer.
+                // Close the deflater input so workers finish once they have drained it, and join
+                // them all. Record a panic rather than returning early on it: we must still close
+                // the order channel and join the writer thread so it is never left detached. That
+                // close then lets the writer thread drain its queue, append EOF, and hand back the
+                // inner writer.
                 drop(deflate_tx);
+                let mut deflater_panicked = false;
                 for handle in deflater_handles.drain(..) {
-                    handle.join().map_err(|_| thread_panicked("deflater"))?;
+                    deflater_panicked |= handle.join().is_err();
                 }
                 drop(order_tx);
-                writer_handle.join().map_err(|_| thread_panicked("writer"))?
+                let writer_result = writer_handle.join().map_err(|_| thread_panicked("writer"))?;
+
+                // Error precedence, most informative first: the writer thread's own I/O/compression
+                // failure, then a deflater panic, then a failed final dispatch. A clean writer exit
+                // implies the others succeeded too, so the later checks are safety nets.
+                let writer = writer_result?;
+                if deflater_panicked {
+                    return Err(thread_panicked("deflater"));
+                }
+                send_result.map(|()| writer)
             }
             State::Done => Err(io::Error::new(io::ErrorKind::Other, "writer already finished")),
         }
@@ -533,6 +549,49 @@ mod tests {
         assert!(
             rx.recv_timeout(Duration::from_secs(5)).is_ok(),
             "MultithreadedWriter::drop hung after the sink failed"
+        );
+    }
+
+    /// A sink whose every write fails with a distinctive error, modelling a persistently broken
+    /// destination (e.g. a full disk). The message lets tests tell the *real* error apart from a
+    /// generic pipeline-stopped placeholder.
+    #[derive(Debug)]
+    struct AlwaysFailSink;
+    impl Write for AlwaysFailSink {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::Other, "disk full"))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// When the sink has already failed and a partial block is still buffered, `finish()` must
+    /// surface the writer thread's real I/O error — not a generic "pipeline stopped" placeholder —
+    /// and must leave the writer finished so a second call reports "already finished" rather than
+    /// re-running (which is how the real error used to leak out only on the second call).
+    #[test]
+    fn finish_surfaces_real_error_when_block_buffered() {
+        let mut w = MultithreadedWriter::with_capacity(
+            NonZero::new(2).unwrap(),
+            AlwaysFailSink,
+            level(6),
+            1024,
+        );
+        // Enough full blocks to overflow the pipeline so the writer thread exits on the sink error
+        // and the caller's writes begin to fail.
+        assert!(w.write_all(&[0u8; 1024 * 50]).is_err());
+        // A sub-block write only buffers locally (no dispatch, since it stays under blocksize), so
+        // a partial block is pending at finish time — the case that used to mask the real error.
+        w.write_all(&[0u8; 100]).unwrap();
+
+        let first = w.finish().unwrap_err();
+        assert_eq!(first.to_string(), "disk full", "finish() must surface the real sink error");
+
+        let second = w.finish().unwrap_err();
+        assert!(
+            second.to_string().contains("already finished"),
+            "after finish() the writer must be Done, got: {second}"
         );
     }
 
