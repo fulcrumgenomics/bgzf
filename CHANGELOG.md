@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- The store-only `Writer` (compression level 0) now computes each block's CRC32 in one pass over the assembled block instead of updating a running CRC on every `write` call. Output is byte-identical; callers that write many small pieces per block see substantially less CRC overhead, since per-call setup no longer keeps libdeflate's CRC kernel from reaching full throughput.
+
 ### Added
 - `Reader` now implements `std::io::BufRead` (matching `MultithreadedReader`), enabling
   `read_until`, `lines`, etc., and letting callers borrow the decompressed block buffer directly

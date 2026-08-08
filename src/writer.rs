@@ -52,8 +52,6 @@ where
     /// True at compression level 0: blocks are emitted as DEFLATE stored blocks without invoking
     /// libdeflate, accumulating straight into `compressed_buffer`.
     store_only: bool,
-    /// Running CRC32 over the bytes accumulated in the current store-only block.
-    store_crc: Crc,
     /// Number of data bytes accumulated in the current store-only block.
     store_data_len: usize,
     /// The inner writer, wrapped in Option to allow taking ownership in finish()
@@ -98,7 +96,6 @@ where
             level: compression_level,
             compressor,
             store_only,
-            store_crc: Crc::new(),
             store_data_len: 0,
             writer: Some(writer),
             poisoned: false,
@@ -167,7 +164,6 @@ where
             let n = (self.blocksize - self.store_data_len).min(remaining.len());
             let start = data_offset + self.store_data_len;
             self.compressed_buffer[start..start + n].copy_from_slice(&remaining[..n]);
-            self.store_crc.update(&remaining[..n]);
             self.store_data_len += n;
             remaining = &remaining[n..];
             if self.store_data_len == self.blocksize {
@@ -195,10 +191,16 @@ where
         self.compressed_buffer[BGZF_HEADER_SIZE + 3..BGZF_HEADER_SIZE + 5]
             .copy_from_slice(&(!len).to_le_bytes());
 
-        // BGZF footer: CRC32 of the data followed by the uncompressed size.
+        // BGZF footer: CRC32 of the data followed by the uncompressed size. One CRC pass over the
+        // whole block rather than a running update per `write` call: libdeflate's CRC has real
+        // per-call setup before its wide SIMD kernel, so record-sized updates (a BAM writer hands
+        // this path a 4-byte length prefix and a ~400-byte record at a time) never reach full
+        // throughput. The block's bytes were just copied in, so this pass reads warm cache lines.
+        let mut crc = Crc::new();
+        crc.update(&self.compressed_buffer[data_offset..data_offset + data_len]);
         let footer_offset = data_offset + data_len;
         self.compressed_buffer[footer_offset..footer_offset + BGZF_SIZEOF_CRC32]
-            .copy_from_slice(&self.store_crc.sum().to_le_bytes());
+            .copy_from_slice(&crc.sum().to_le_bytes());
         self.compressed_buffer[footer_offset + BGZF_SIZEOF_CRC32..footer_offset + BGZF_FOOTER_SIZE]
             .copy_from_slice(&(data_len as u32).to_le_bytes());
 
@@ -212,7 +214,6 @@ where
             return Err(e);
         }
 
-        self.store_crc = Crc::new();
         self.store_data_len = 0;
         Ok(())
     }
