@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.5.0] - 2026-08-09
 
 ### Changed
 - The store-only `Writer` (compression level 0) now computes each block's CRC32 in one pass over the assembled block instead of updating a running CRC on every `write` call. Output is byte-identical; callers that write many small pieces per block see substantially less CRC overhead, since per-call setup no longer keeps libdeflate's CRC kernel from reaching full throughput.
