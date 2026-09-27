@@ -5,7 +5,7 @@ This document describes how to release a new version of bgzf.
 ## Prerequisites
 
 1. Ensure you have push access to the repository
-2. Ensure `CARGO_REGISTRY_TOKEN` secret is configured in GitHub repository settings
+2. Publishing uses crates.io [trusted publishing](https://crates.io/docs/trusted-publishing); no API token secret is needed. The `bgzf` crate on crates.io must list `fulcrumgenomics/bgzf` with workflow `release.yml` as a trusted publisher
 
 ## Release Process
 
